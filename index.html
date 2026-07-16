@@ -674,7 +674,9 @@
             }
             
             // 计算调整后的方向
-            const direction = close > open ? 1 : -1;
+            const isUpCandle = close > open;
+            const isDownCandle = close < open;
+            const direction = isDownCandle ? -1 : 1;
             
             // 按页面配置的最小涨跌幅约束实体，避免和配置口径不一致
             const minChangeCloseUp = open * (1 + minChange / 100);
@@ -721,6 +723,13 @@
             
             high = clampValue(high, bodyTop, maxHigh);
             low = clampValue(low, minLow, bodyBottom);
+
+            // 1分钟K线口径：涨则开盘价原则上为最低价，跌则开盘价原则上为最高价
+            if (isUpCandle) {
+                low = open;
+            } else if (isDownCandle) {
+                high = open;
+            }
             
             return [open, close, low, high];
         }
@@ -1391,6 +1400,39 @@
                 }
             }
 
+            for (let i = 0; i < adjusted.length; i++) {
+                adjusted[i] = roundMinutePrice(adjusted[i]);
+            }
+
+            for (let i = 1; i < adjusted.length; i++) {
+                if (Math.abs(adjusted[i] - adjusted[i - 1]) >= 0.0000001) {
+                    continue;
+                }
+
+                if (i === adjusted.length - 1) {
+                    const referencePrice = i >= 2 ? adjusted[i - 2] : startPrice;
+                    const fallbackDirection = Math.sign(adjusted[i] - referencePrice) || direction || 1;
+                    adjusted[i - 1] = ensureUniqueMinutePrice(
+                        adjusted[i - 1],
+                        referencePrice,
+                        fallbackDirection,
+                        low,
+                        high,
+                        minTickChange
+                    );
+                } else {
+                    const fallbackDirection = Math.sign(endPrice - adjusted[i - 1]) || direction || 1;
+                    adjusted[i] = ensureUniqueMinutePrice(
+                        adjusted[i],
+                        adjusted[i - 1],
+                        fallbackDirection,
+                        low,
+                        high,
+                        minTickChange
+                    );
+                }
+            }
+
             return adjusted;
         }
 
@@ -1787,6 +1829,302 @@
             return clampValue(candidatePrice, allowedMin, allowedMax);
         }
 
+        function getMinutePricePrecision() {
+            return 4;
+        }
+
+        function roundMinutePrice(value) {
+            return Number(Number(value).toFixed(getMinutePricePrecision()));
+        }
+
+        function getMinutePriceTickUnit(price, minTickChange) {
+            const referencePrice = Math.max(Math.abs(price || 0), 1);
+            const percentTick = referencePrice * (Math.max(0, Number(minTickChange) || 0) / 100);
+            return Math.max(percentTick, 0.0001);
+        }
+
+        function getMinuteMinimumChangePercent(minTickChange) {
+            const baseMin = Math.max(0, Number(minTickChange) || 0);
+            return baseMin + (Math.random() * 0.008 + 0.001);
+        }
+
+        function nudgeMinuteUniquePrice(candidatePrice, lastPrice, direction, minTickChange) {
+            const epsilon = 0.0000001;
+            let nextPrice = roundMinutePrice(candidatePrice);
+            const lastRounded = roundMinutePrice(lastPrice);
+
+            if (Math.abs(nextPrice - lastRounded) >= epsilon) {
+                return nextPrice;
+            }
+
+            const tickUnit = getMinutePriceTickUnit(lastPrice, minTickChange);
+            const signedTick = (direction >= 0 ? 1 : -1) * (tickUnit + Math.random() * tickUnit * 0.1);
+            nextPrice = roundMinutePrice(lastPrice + signedTick);
+
+            if (Math.abs(nextPrice - lastRounded) >= epsilon) {
+                return nextPrice;
+            }
+
+            const microTick = (direction >= 0 ? 1 : -1) * (0.0001 + Math.random() * 0.0009);
+            return roundMinutePrice(lastPrice + microTick);
+        }
+
+        function enforceMinuteChangeFloor(lastPrice, candidatePrice, direction, minTickChange) {
+            const epsilon = 0.0000001;
+            const actualPct = lastPrice !== 0 ? Math.abs((candidatePrice - lastPrice) / lastPrice * 100) : 0;
+            if (actualPct + epsilon >= Math.max(0, Number(minTickChange) || 0)) {
+                return roundMinutePrice(candidatePrice);
+            }
+
+            const floorPct = getMinuteMinimumChangePercent(minTickChange);
+            return roundMinutePrice(lastPrice * (1 + (direction >= 0 ? 1 : -1) * floorPct / 100));
+        }
+
+        function getMinuteProtectedBoundaryPrice(lastPrice, direction, low, high, minTickChange, allowBoundaryTouch) {
+            const unit = getMinutePriceTickUnit(direction >= 0 ? Math.max(lastPrice, high) : Math.max(lastPrice, low), minTickChange);
+            const offset = Math.max(unit * 0.12, 0.0001);
+            return direction >= 0
+                ? (allowBoundaryTouch ? high : high - offset)
+                : (allowBoundaryTouch ? low : low + offset);
+        }
+
+        function getSafeChange(lastPrice, targetPrice, remainingSteps, minTickChange, maxTickChange, low, high, options = {}) {
+            const epsilon = 0.0000001;
+            const fallbackDirection = Number.isFinite(options.direction) ? options.direction : 0;
+            const direction = Math.sign(targetPrice - lastPrice) || fallbackDirection || 1;
+            const attractionFactor = targetPrice - lastPrice;
+            const targetPctPerStep = lastPrice !== 0
+                ? Math.abs(attractionFactor / lastPrice * 100) / Math.max(remainingSteps, 1)
+                : 0;
+            const minSafePct = getMinuteMinimumChangePercent(minTickChange);
+            const configuredMax = Math.max(0, Number(maxTickChange) || 0);
+            const maxSafePct = targetPctPerStep > configuredMax + epsilon
+                ? targetPctPerStep
+                : Math.max(configuredMax, minSafePct);
+            const noiseFactor = 1 + (Math.random() * 0.1 - 0.05);
+            let safePct = Math.max(targetPctPerStep * noiseFactor, minSafePct);
+            if (targetPctPerStep <= configuredMax + epsilon) {
+                safePct = Math.min(safePct, Math.max(configuredMax, minSafePct));
+            } else {
+                safePct = Math.max(safePct, targetPctPerStep);
+            }
+
+            const allowBoundaryTouch = Boolean(options.allowBoundaryTouch);
+            const protectedBoundary = getMinuteProtectedBoundaryPrice(lastPrice, direction, low, high, minTickChange, allowBoundaryTouch);
+
+            if (remainingSteps === 2) {
+                const factor = minSafePct / 100;
+                const candidatePrices = [
+                    targetPrice / (1 + factor),
+                    targetPrice / Math.max(1 - factor, 0.000001)
+                ];
+
+                const chosen = candidatePrices
+                    .filter(value => Number.isFinite(value))
+                    .filter(value => value >= low - epsilon && value <= high + epsilon)
+                    .filter(value => direction >= 0 ? value <= protectedBoundary + epsilon : value >= protectedBoundary - epsilon)
+                    .map(value => {
+                        const firstPct = lastPrice !== 0 ? Math.abs((value - lastPrice) / lastPrice * 100) : 0;
+                        const finalPct = value !== 0 ? Math.abs((targetPrice - value) / value * 100) : 0;
+                        const penalty = (firstPct < minSafePct ? 10 : 0) + (finalPct < minSafePct ? 10 : 0);
+                        return {
+                            value,
+                            firstPct,
+                            penalty,
+                            distance: Math.abs(value - targetPrice)
+                        };
+                    })
+                    .sort((a, b) => a.penalty - b.penalty || a.distance - b.distance)[0];
+
+                if (chosen) {
+                    safePct = Math.max(chosen.firstPct, minSafePct);
+                    return (chosen.value >= lastPrice ? 1 : -1) * safePct;
+                }
+            }
+
+            const candidatePrice = lastPrice * (1 + direction * safePct / 100);
+            if (direction >= 0 && candidatePrice > protectedBoundary + epsilon) {
+                const protectedPct = lastPrice !== 0 ? Math.abs((protectedBoundary - lastPrice) / lastPrice * 100) : minSafePct;
+                safePct = Math.max(Math.min(protectedPct * 0.98, maxSafePct), minSafePct);
+            } else if (direction < 0 && candidatePrice < protectedBoundary - epsilon) {
+                const protectedPct = lastPrice !== 0 ? Math.abs((protectedBoundary - lastPrice) / lastPrice * 100) : minSafePct;
+                safePct = Math.max(Math.min(protectedPct * 0.98, maxSafePct), minSafePct);
+            }
+
+            if (!Number.isFinite(safePct) || safePct <= epsilon) {
+                safePct = minSafePct;
+            }
+
+            return direction * safePct;
+        }
+
+        function ensureUniqueMinutePrice(candidatePrice, prevPrice, direction, low, high, minTickChange) {
+            const epsilon = 0.0000001;
+            let nextPrice = roundMinutePrice(clampValue(candidatePrice, low, high));
+            const prevRounded = roundMinutePrice(prevPrice);
+
+            if (Math.abs(nextPrice - prevRounded) >= epsilon) {
+                return nextPrice;
+            }
+
+            const tickUnit = getMinutePriceTickUnit(prevPrice, minTickChange);
+            const signedTick = (direction >= 0 ? 1 : -1) * tickUnit;
+            nextPrice = roundMinutePrice(clampValue(prevPrice + signedTick, low, high));
+
+            if (Math.abs(nextPrice - prevRounded) >= epsilon) {
+                return nextPrice;
+            }
+
+            const fallbackTick = direction >= 0 ? 0.0001 : -0.0001;
+            return roundMinutePrice(clampValue(prevPrice + fallbackTick, low, high));
+        }
+
+        function getSegmentStepBounds(startPrice, endPrice, minTickChange, maxTickChange) {
+            const epsilon = 0.0000001;
+            const tickRange = normalizeAbsolutePercentRange(minTickChange, maxTickChange);
+            const ratio = startPrice > 0 ? endPrice / startPrice : 1;
+            const movement = Math.abs(endPrice - startPrice);
+
+            if (movement < epsilon || !Number.isFinite(ratio) || ratio <= 0) {
+                return {
+                    move: movement,
+                    minSteps: 0,
+                    maxSteps: 0
+                };
+            }
+
+            let minSteps = 1;
+            let maxSteps = Number.MAX_SAFE_INTEGER;
+
+            if (endPrice > startPrice) {
+                const maxFactor = 1 + tickRange.max / 100;
+                const minFactor = 1 + tickRange.min / 100;
+                minSteps = tickRange.max > 0
+                    ? Math.max(1, Math.ceil(Math.log(ratio) / Math.log(maxFactor)))
+                    : 1;
+                maxSteps = tickRange.min > 0
+                    ? Math.max(minSteps, Math.floor(Math.log(ratio) / Math.log(minFactor)))
+                    : Number.MAX_SAFE_INTEGER;
+            } else {
+                const maxDownFactor = Math.max(1 - tickRange.max / 100, 0.000001);
+                const minDownFactor = Math.max(1 - tickRange.min / 100, 0.000001);
+                minSteps = tickRange.max > 0
+                    ? Math.max(1, Math.ceil(Math.log(ratio) / Math.log(maxDownFactor)))
+                    : 1;
+                maxSteps = tickRange.min > 0
+                    ? Math.max(minSteps, Math.floor(Math.log(ratio) / Math.log(minDownFactor)))
+                    : Number.MAX_SAFE_INTEGER;
+            }
+
+            return {
+                move: movement,
+                movePercent: startPrice !== 0 ? Math.abs((endPrice - startPrice) / startPrice * 100) : 0,
+                minSteps: Math.max(1, minSteps),
+                maxSteps: Math.max(2, minSteps, maxSteps)
+            };
+        }
+
+        function allocateSegmentTicksByConstraints(segments, desiredTotalSteps, minTickChange, maxTickChange) {
+            if (!Array.isArray(segments) || segments.length === 0) {
+                return {
+                    segments: [],
+                    totalSteps: 0,
+                    overflowAllowed: false
+                };
+            }
+
+            const activeSegments = segments.map((segment, index) => {
+                const bounds = getSegmentStepBounds(segment.start, segment.end, minTickChange, maxTickChange);
+                const requiresStretch = bounds.movePercent > 0 && bounds.movePercent < Math.max(0, minTickChange);
+                const forcedMinTicks = Math.max(0, Number(segment.minTicksConstraint) || 0);
+                const basePreferredMin = bounds.maxSteps >= 2
+                    ? Math.min(bounds.maxSteps, Math.max(bounds.minSteps, requiresStretch ? 2 : 1))
+                    : Math.max(0, bounds.maxSteps);
+                const preferredMin = Math.max(basePreferredMin, forcedMinTicks);
+
+                return {
+                    ...segment,
+                    sourceIndex: index,
+                    weight: Math.max(bounds.move, 0.0001),
+                    bounds,
+                    forcedMinTicks,
+                    preferredMin,
+                    ticks: 0
+                };
+            }).filter(segment => segment.bounds.maxSteps > 0);
+
+            if (activeSegments.length === 0) {
+                return {
+                    segments: [],
+                    totalSteps: 0,
+                    overflowAllowed: false
+                };
+            }
+
+            let overflowAllowed = false;
+            const minimumOneEach = activeSegments.length;
+            const preferredMinTotal = activeSegments.reduce((sum, segment) => sum + segment.preferredMin, 0);
+
+            if (desiredTotalSteps < preferredMinTotal) {
+                overflowAllowed = true;
+                activeSegments.forEach(segment => {
+                    segment.ticks = 1;
+                });
+
+                let remaining = Math.max(0, desiredTotalSteps - minimumOneEach);
+                const sortedByWeight = activeSegments.slice().sort((a, b) => b.weight - a.weight);
+                let cursor = 0;
+                while (remaining > 0 && sortedByWeight.length > 0) {
+                    sortedByWeight[cursor % sortedByWeight.length].ticks += 1;
+                    cursor++;
+                    remaining--;
+                }
+            } else {
+                activeSegments.forEach(segment => {
+                    segment.ticks = segment.preferredMin;
+                });
+
+                let remaining = Math.max(0, desiredTotalSteps - preferredMinTotal);
+                const byWeight = activeSegments.slice().sort((a, b) => b.weight - a.weight);
+
+                while (remaining > 0 && byWeight.length > 0) {
+                    let progressed = false;
+                    for (const segment of byWeight) {
+                        if (remaining <= 0) {
+                            break;
+                        }
+                        if (segment.ticks < segment.bounds.maxSteps) {
+                            segment.ticks += 1;
+                            remaining -= 1;
+                            progressed = true;
+                        }
+                    }
+
+                    if (remaining <= 0) {
+                        break;
+                    }
+
+                    if (!progressed) {
+                        overflowAllowed = true;
+                        for (const segment of byWeight) {
+                            if (remaining <= 0) {
+                                break;
+                            }
+                            segment.ticks += 1;
+                            remaining -= 1;
+                        }
+                    }
+                }
+            }
+
+            const totalSteps = activeSegments.reduce((sum, segment) => sum + segment.ticks, 0);
+            return {
+                segments: activeSegments.map(({ bounds, preferredMin, forcedMinTicks, weight, sourceIndex, ...segment }) => segment),
+                totalSteps,
+                overflowAllowed
+            };
+        }
+
         function separateMinuteEndpoint(prevPrice, candidatePrice, preferredDirection, low, high, minTickChange) {
             const epsilon = 0.000001;
             if (Math.abs(candidatePrice - prevPrice) >= epsilon) {
@@ -2073,12 +2411,97 @@
                 pushAnchor(lowIndex, low);
             }
             pushAnchor(lastIndex, close);
+
+            const minTailGap = 5;
+            if (lastIndex >= minTailGap + 1) {
+                const preferredPreCloseIndex = clampValue(lastIndex - minTailGap, 1, Math.max(1, lastIndex - 2));
+                if (Math.abs(close - low) < epsilon && Math.abs(high - low) > epsilon) {
+                    const shiftPctNear = getMinuteMinimumChangePercent(minTickChange);
+                    let nearClosePrice = close * (1 + shiftPctNear / 100);
+                    nearClosePrice = clampValue(nearClosePrice, low + epsilon, high - epsilon);
+                    if (Math.abs(nearClosePrice - close) > epsilon) {
+                        let nearIndex = clampValue(lastIndex - 1, 1, Math.max(1, lastIndex - 1));
+                        while (nearIndex >= 1 && (anchorMap.has(nearIndex) || nearIndex === lastIndex)) {
+                            nearIndex -= 1;
+                        }
+                        if (nearIndex >= 1) {
+                            anchorMap.set(nearIndex, roundMinutePrice(nearClosePrice));
+                        }
+                    }
+
+                    const shiftPctFar = getMinuteMinimumChangePercent(minTickChange);
+                    let preClosePrice = close * (1 + shiftPctFar / 100);
+                    preClosePrice = clampValue(preClosePrice, low + epsilon, high - epsilon);
+                    if (Math.abs(preClosePrice - close) > epsilon) {
+                        let preCloseIndex = preferredPreCloseIndex;
+                        while (preCloseIndex >= 1 && (anchorMap.has(preCloseIndex) || preCloseIndex === lastIndex)) {
+                            preCloseIndex -= 1;
+                        }
+                        if (preCloseIndex >= 1) {
+                            anchorMap.set(preCloseIndex, roundMinutePrice(preClosePrice));
+                        }
+                    }
+                } else if (Math.abs(close - high) < epsilon && Math.abs(high - low) > epsilon) {
+                    const shiftPctNear = getMinuteMinimumChangePercent(minTickChange);
+                    let nearClosePrice = close * (1 - shiftPctNear / 100);
+                    nearClosePrice = clampValue(nearClosePrice, low + epsilon, high - epsilon);
+                    if (Math.abs(nearClosePrice - close) > epsilon) {
+                        let nearIndex = clampValue(lastIndex - 1, 1, Math.max(1, lastIndex - 1));
+                        while (nearIndex >= 1 && (anchorMap.has(nearIndex) || nearIndex === lastIndex)) {
+                            nearIndex -= 1;
+                        }
+                        if (nearIndex >= 1) {
+                            anchorMap.set(nearIndex, roundMinutePrice(nearClosePrice));
+                        }
+                    }
+
+                    const shiftPctFar = getMinuteMinimumChangePercent(minTickChange);
+                    let preClosePrice = close * (1 - shiftPctFar / 100);
+                    preClosePrice = clampValue(preClosePrice, low + epsilon, high - epsilon);
+                    if (Math.abs(preClosePrice - close) > epsilon) {
+                        let preCloseIndex = preferredPreCloseIndex;
+                        while (preCloseIndex >= 1 && (anchorMap.has(preCloseIndex) || preCloseIndex === lastIndex)) {
+                            preCloseIndex -= 1;
+                        }
+                        if (preCloseIndex >= 1) {
+                            anchorMap.set(preCloseIndex, roundMinutePrice(preClosePrice));
+                        }
+                    }
+                }
+            }
             
             const anchors = Array.from(anchorMap.entries())
                 .map(([index, price]) => ({ index, price }))
                 .sort((a, b) => a.index - b.index);
-            
-            return normalizeMinuteAnchors(anchors, lastIndex, minTickChange);
+
+            const normalizedAnchors = normalizeMinuteAnchors(anchors, lastIndex, minTickChange);
+
+            if (lastIndex >= 2 && Math.abs(high - low) > epsilon) {
+                const tailMap = new Map(normalizedAnchors.map(anchor => [anchor.index, anchor.price]));
+                const tailIndex = lastIndex - 1;
+
+                if (Math.abs(close - low) < epsilon) {
+                    const shiftPctNear = getMinuteMinimumChangePercent(minTickChange);
+                    const nearClosePrice = roundMinutePrice(clampValue(close * (1 + shiftPctNear / 100), low + epsilon, high - epsilon));
+                    if (Math.abs(nearClosePrice - close) > epsilon) {
+                        tailMap.set(tailIndex, nearClosePrice);
+                    }
+                } else if (Math.abs(close - high) < epsilon) {
+                    const shiftPctNear = getMinuteMinimumChangePercent(minTickChange);
+                    const nearClosePrice = roundMinutePrice(clampValue(close * (1 - shiftPctNear / 100), low + epsilon, high - epsilon));
+                    if (Math.abs(nearClosePrice - close) > epsilon) {
+                        tailMap.set(tailIndex, nearClosePrice);
+                    }
+                }
+
+                const tailAnchors = Array.from(tailMap.entries())
+                    .map(([index, price]) => ({ index, price }))
+                    .sort((a, b) => a.index - b.index);
+
+                return tailAnchors;
+            }
+
+            return normalizedAnchors;
         }
         
         function buildConstrainedMinuteBridge(startPrice, endPrice, totalSteps, direction, minTickChange, maxTickChange, low, high, styleProfile, absoluteStartIndex, absoluteEndIndex, highAnchorIndex, lowAnchorIndex) {
@@ -2086,19 +2509,8 @@
                 return [];
             }
             
-            const profile = styleProfile || getMinuteStyleProfile(currentStyle, endPrice >= startPrice ? 'pureUp' : 'pureDown');
             const prices = [];
             const epsilon = 0.000001;
-            const totalMove = endPrice - startPrice;
-            const avgSignedStep = totalMove / Math.max(totalSteps, 1);
-            let legacySteps = Math.abs(avgSignedStep) > epsilon
-                ? generateSteps(totalSteps, avgSignedStep, direction >= 0 ? 1 : -1)
-                : new Array(totalSteps).fill(0);
-
-            if (legacySteps.length > 1) {
-                legacySteps = addVibration(legacySteps.slice(), direction >= 0 ? 1 : -1, totalMove);
-            }
-
             let prevPrice = startPrice;
             
             for (let step = 1; step <= totalSteps; step++) {
@@ -2107,44 +2519,53 @@
                 let nextPrice;
                 
                 if (step === totalSteps) {
-                    nextPrice = endPrice;
+                    nextPrice = roundMinutePrice(endPrice);
                 } else {
-                    const progress = step / totalSteps;
-                    const rawStep = legacySteps[Math.min(step - 1, legacySteps.length - 1)] || 0;
-                    const stepCandidate = prevPrice + rawStep;
-                    const wave = Math.sin(progress * Math.PI * 2) * (high - low) * profile.waveStrength * 0.05;
-                    const accel = (progress - profile.progressBias) * Math.abs(endPrice - startPrice) * profile.acceleration * 0.18;
-                    const jitter = (Math.random() - 0.5) * (high - low) * profile.jitterStrength * 0.04;
-                    const desiredProgress = clampValue(progress + (progress - 0.5) * profile.acceleration * 0.18, 0.02, 0.98);
-                    const guidePrice = startPrice + (endPrice - startPrice) * desiredProgress;
-                    const candidate = stepCandidate + wave + accel + jitter + (guidePrice - stepCandidate) * 0.18;
-                    const localDirection = Math.sign(rawStep) || direction;
-                    nextPrice = localDirection === direction
-                        ? projectPriceIntoBounds(
-                            prevPrice,
-                            candidate,
-                            endPrice,
-                            remainingSteps,
-                            direction,
-                            minTickChange,
-                            maxTickChange
-                        )
-                        : projectFlexibleMinutePrice(
-                            prevPrice,
-                            candidate,
-                            endPrice,
-                            remainingSteps,
-                            minTickChange,
-                            maxTickChange,
-                            low,
-                            high
-                        );
-                    
-                    if (absoluteIndex !== highAnchorIndex && Math.abs(nextPrice - high) < epsilon) {
-                        nextPrice = Math.min(high - epsilon, nextPrice);
+                    const currentDirection = Math.sign(endPrice - prevPrice) || direction || 1;
+                    const allowHighTouch = absoluteIndex === highAnchorIndex;
+                    const allowLowTouch = absoluteIndex === lowAnchorIndex;
+                    const signedChange = getSafeChange(
+                        prevPrice,
+                        endPrice,
+                        remainingSteps,
+                        minTickChange,
+                        maxTickChange,
+                        low,
+                        high,
+                        {
+                            direction: currentDirection,
+                            allowBoundaryTouch: (currentDirection >= 0 && allowHighTouch) || (currentDirection < 0 && allowLowTouch)
+                        }
+                    );
+                    const attractionFactor = remainingSteps <= 2 ? 0 : (endPrice - prevPrice) * 0.08;
+                    nextPrice = prevPrice * (1 + signedChange / 100) + attractionFactor;
+                    nextPrice = nudgeMinuteUniquePrice(nextPrice, prevPrice, Math.sign(signedChange) || currentDirection, minTickChange);
+                    nextPrice = enforceMinuteChangeFloor(prevPrice, nextPrice, Math.sign(signedChange) || currentDirection, minTickChange);
+
+                    if (remainingSteps === 2) {
+                        const floorPct = getMinuteMinimumChangePercent(minTickChange);
+                        const tailDirection = Math.sign(endPrice - nextPrice) || currentDirection || 1;
+                        const tailPct = nextPrice !== 0 ? Math.abs((endPrice - nextPrice) / nextPrice * 100) : 0;
+                        if (tailPct + epsilon < Math.max(0, Number(minTickChange) || 0)) {
+                            let forcedSecondLast = tailDirection >= 0
+                                ? endPrice / (1 + floorPct / 100)
+                                : endPrice / Math.max(1 - floorPct / 100, 0.000001);
+                            forcedSecondLast = clampValue(forcedSecondLast, low + epsilon, high - epsilon);
+                            forcedSecondLast = nudgeMinuteUniquePrice(forcedSecondLast, prevPrice, tailDirection, minTickChange);
+                            forcedSecondLast = enforceMinuteChangeFloor(prevPrice, forcedSecondLast, tailDirection, minTickChange);
+                            nextPrice = forcedSecondLast;
+                        }
                     }
-                    if (absoluteIndex !== lowAnchorIndex && Math.abs(nextPrice - low) < epsilon) {
-                        nextPrice = Math.max(low + epsilon, nextPrice);
+
+                    if (!allowHighTouch && nextPrice >= high - epsilon) {
+                        const protectedHigh = getMinuteProtectedBoundaryPrice(prevPrice, 1, low, high, minTickChange, false);
+                        nextPrice = nudgeMinuteUniquePrice(protectedHigh, prevPrice, -1, minTickChange);
+                        nextPrice = enforceMinuteChangeFloor(prevPrice, nextPrice, -1, minTickChange);
+                    }
+                    if (!allowLowTouch && nextPrice <= low + epsilon) {
+                        const protectedLow = getMinuteProtectedBoundaryPrice(prevPrice, -1, low, high, minTickChange, false);
+                        nextPrice = nudgeMinuteUniquePrice(protectedLow, prevPrice, 1, minTickChange);
+                        nextPrice = enforceMinuteChangeFloor(prevPrice, nextPrice, 1, minTickChange);
                     }
                 }
                 
@@ -2152,16 +2573,62 @@
                 prevPrice = nextPrice;
             }
 
-            return suppressMinutePingPongSeries(
-                prices,
-                startPrice,
-                endPrice,
-                direction,
+            return prices;
+        }
+
+        function applyMinutePreCloseTailAnchors(details, open, high, low, close, minTickChange, maxTickChange, styleProfile) {
+            if (!Array.isArray(details) || details.length < 7) {
+                return details;
+            }
+
+            const lastIndex = details.length - 1;
+            const epsilon = 0.000001;
+            const tailGap = 5;
+            const tailStartIndex = lastIndex - tailGap;
+
+            const closeEqualsLow = Math.abs(close - low) < epsilon;
+            const closeEqualsHigh = Math.abs(close - high) < epsilon;
+            if (!closeEqualsLow && !closeEqualsHigh) {
+                return details;
+            }
+
+            const baseShift = getMinuteMinimumChangePercent(minTickChange);
+            let nearClosePrice = closeEqualsLow
+                ? close * (1 + baseShift / 100)
+                : close * (1 - baseShift / 100);
+            nearClosePrice = roundMinutePrice(clampValue(nearClosePrice, low + epsilon, high - epsilon));
+            if (Math.abs(nearClosePrice - close) <= epsilon) {
+                return details;
+            }
+
+            const tailStartPrice = clampValue(details[tailStartIndex].price, low, high);
+            const inferredTrendType = close > open ? 'pureUp' : (close < open ? 'pureDown' : 'normal');
+            const profile = styleProfile || getMinuteStyleProfile(currentStyle, inferredTrendType);
+            const bridgeDirection = getSegmentDirection(tailStartPrice, nearClosePrice, nearClosePrice >= tailStartPrice ? 1 : -1);
+            const bridgeSteps = (lastIndex - 1) - tailStartIndex;
+            const bridgePrices = buildConstrainedMinuteBridge(
+                tailStartPrice,
+                nearClosePrice,
+                bridgeSteps,
+                bridgeDirection,
                 minTickChange,
                 maxTickChange,
                 low,
-                high
+                high,
+                profile,
+                tailStartIndex,
+                lastIndex - 1,
+                -1,
+                -1
             );
+
+            for (let i = 0; i < bridgePrices.length; i++) {
+                details[tailStartIndex + 1 + i].price = bridgePrices[i];
+            }
+
+            details[lastIndex - 1].price = nearClosePrice;
+            details[lastIndex].price = roundMinutePrice(close);
+            return details;
         }
         
         function projectPriceFromPrevious(prevPrice, currentPrice, minTickChange, maxTickChange, low, high) {
@@ -2437,6 +2904,7 @@
                 maxTickChange
             );
             suppressMinuteDetailPingPong(directAligned, directFixedIndices, minTickChange, maxTickChange, low, high);
+            applyMinutePreCloseTailAnchors(directAligned, open, high, low, close, minTickChange, maxTickChange, styleProfile);
 
             const directValidation = validateMinuteDetailSeries(directAligned, open, high, low, close, minTickChange, maxTickChange);
             if (
@@ -2546,6 +3014,7 @@
 
                 const passValidation = validateMinuteDetailSeries(aligned, open, high, low, close, minTickChange, maxTickChange);
                 if (passValidation.allCompliant && passValidation.candleMatched && passValidation.uniqueHigh && passValidation.uniqueLow) {
+                    applyMinutePreCloseTailAnchors(aligned, open, high, low, close, minTickChange, maxTickChange, styleProfile);
                     return refreshMinuteDetailMetrics(aligned, minTickChange, maxTickChange);
                 }
             }
@@ -2610,10 +3079,28 @@
 
             const fallbackValidation = validateMinuteDetailSeries(aligned, open, high, low, close, minTickChange, maxTickChange);
             if (fallbackValidation.allCompliant && fallbackValidation.candleMatched && fallbackValidation.uniqueHigh && fallbackValidation.uniqueLow) {
+                applyMinutePreCloseTailAnchors(aligned, open, high, low, close, minTickChange, maxTickChange, styleProfile);
                 return refreshMinuteDetailMetrics(aligned, minTickChange, maxTickChange);
             }
             
+            applyMinutePreCloseTailAnchors(aligned, open, high, low, close, minTickChange, maxTickChange, styleProfile);
             return refreshMinuteDetailMetrics(aligned, minTickChange, maxTickChange);
+        }
+
+        const __origGenerateStandardPatternMinute = generateStandardPatternMinute;
+        generateStandardPatternMinute = function(open, high, low, close, minVolume, maxVolume, minAmount, maxAmount, trendType, minTickChange, maxTickChange) {
+            const result = __origGenerateStandardPatternMinute(open, high, low, close, minVolume, maxVolume, minAmount, maxAmount, trendType, minTickChange, maxTickChange);
+            if (!result || !Array.isArray(result.details) || result.details.length < 2) {
+                return result;
+            }
+
+            const inferredTrendType = close > open ? 'pureUp' : (close < open ? 'pureDown' : 'normal');
+            const profile = getMinuteStyleProfile(currentStyle, inferredTrendType);
+            applyMinutePreCloseTailAnchors(result.details, open, high, low, close, minTickChange, maxTickChange, profile);
+            refreshMinuteDetailMetrics(result.details, minTickChange, maxTickChange);
+            const validation = validateMinuteDetailSeries(result.details, open, high, low, close, minTickChange, maxTickChange);
+            result.allCompliant = Boolean(validation.allCompliant && validation.candleMatched && validation.uniqueHigh && validation.uniqueLow);
+            return result;
         }
         
         function getSegmentPriceBounds(prevPrice, targetPrice, remainingSteps, direction, minTickChange, maxTickChange) {
@@ -3705,15 +4192,15 @@
 
             console.log(`选择形态: 形态${patternIndex}`);
 
-            // 3. 确定总笔数N：在25-45之间取随机整数
+            // 3. 先取期望总笔数，实际笔数在段约束分配后再收口
             const normalizedVolumeRange = normalizeMinuteVolumeRange(minVolume, maxVolume);
-            const totalTicks = normalizedVolumeRange.min + Math.floor(
+            let totalTicks = normalizedVolumeRange.min + Math.floor(
                 Math.random() * (Math.abs(normalizedVolumeRange.max - normalizedVolumeRange.min) + 1)
             );
             const totalAmount = Math.floor(Math.random() * (maxAmount - minAmount + 1)) + minAmount;
-            const avgAmountPerTick = totalAmount / totalTicks;
+            let avgAmountPerTick = totalAmount / totalTicks;
 
-            console.log(`总笔数: ${totalTicks}, 总成交量: ${totalAmount}, 平均每笔: ${avgAmountPerTick.toFixed(2)}`);
+            console.log(`期望总笔数: ${totalTicks}, 总成交量: ${totalAmount}, 平均每笔: ${avgAmountPerTick.toFixed(2)}`);
 
             // 4. 定义20种形态的结构
             const patterns = {
@@ -3876,6 +4363,13 @@
                 segment3 = { start: high, end: close, dir: getSegmentDirection(high, close, close >= high ? 1 : -1), name: '高→收' };
             }
 
+            if (openEqualsHigh && skeletonType === '第一组') {
+                segment3.minTicksConstraint = Math.max(Number(segment3.minTicksConstraint) || 0, 5);
+            }
+            if (openEqualsLow && skeletonType === '第二组') {
+                segment3.minTicksConstraint = Math.max(Number(segment3.minTicksConstraint) || 0, 5);
+            }
+
             // 10. 处理合并
             let segments = [];
 
@@ -3909,7 +4403,18 @@
 
             segments.splice(segment1Ticks > 0 ? 1 : 0, 0, { ...segment2, ticks: segment2Ticks });
 
+            const tickAllocation = allocateSegmentTicksByConstraints(
+                segments,
+                Math.max(totalTicks - 1, 0),
+                minTickChange,
+                maxTickChange
+            );
+            segments = tickAllocation.segments;
+            totalTicks = tickAllocation.totalSteps + 1;
+            avgAmountPerTick = totalAmount / Math.max(totalTicks, 1);
+
             console.log(`实际段数: ${segments.length}`);
+            console.log(`约束后总笔数: ${totalTicks}, 允许超上限: ${tickAllocation.overflowAllowed}`);
 
             // 11. 先确定开高低收位置，再按段串联整分钟价格
             let generatedMinute = null;
