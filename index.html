@@ -91,7 +91,8 @@
             min-width: 120px;
             font-size: 14px;
         }
-        .form-row input {
+        .form-row input,
+        .form-row select {
             flex: 1;
             padding: 8px 12px;
             background: #333;
@@ -100,7 +101,8 @@
             color: #fff;
             font-size: 14px;
         }
-        .form-row input:focus {
+        .form-row input:focus,
+        .form-row select:focus {
             outline: none;
             border-color: #22c55e;
         }
@@ -339,7 +341,7 @@
                     <div class="range-inputs">
                         <input type="number" id="minChange" value="0.5" min="0">
                         <span>至</span>
-                        <input type="number" id="maxChange" value="2" min="0">
+                        <input type="number" id="maxChange" value="" min="0">
                     </div>
                 </div>
                 
@@ -348,17 +350,24 @@
                     <div class="range-inputs">
                         <input type="number" id="minKChange" value="0.5" min="0">
                         <span>至</span>
-                        <input type="number" id="maxKChange" value="2" min="0">
+                        <input type="number" id="maxKChange" value="" min="0">
                     </div>
                 </div>
                 
                 <div class="form-row">
                     <label>高低点范围</label>
                     <div class="range-inputs">
-                        <input type="number" id="minWickChange" value="0.05" min="0">
+                        <input type="number" id="minWickChange" value="0.1" min="0">
                         <span>至</span>
-                        <input type="number" id="maxWickChange" value="0.1" min="0">
+                        <input type="number" id="maxWickChange" value="0.5" min="0">
                     </div>
+                </div>
+
+                <div class="form-row">
+                    <label>模型选项</label>
+                    <select id="selectedModel">
+                        <option value="">随机（按当前趋势）</option>
+                    </select>
                 </div>
             </div>
             
@@ -1121,6 +1130,130 @@
             
             return result;
         }
+
+        function alignTerminalCandleBodyRange(candles, bodyRange, minWickChange, maxWickChange, trendType, startPrice, targetPrice) {
+            if (!Array.isArray(candles) || candles.length < 2) {
+                return candles;
+            }
+
+            const lastIndex = candles.length - 1;
+            const isUp = trendType === 'up';
+            const isDown = trendType === 'down';
+
+            if (!isUp && !isDown) {
+                return candles;
+            }
+
+            let desiredCloses = candles.map(candle => candle[1]);
+            desiredCloses[lastIndex] = targetPrice;
+
+            for (let pass = 0; pass < 4; pass++) {
+                for (let i = lastIndex; i > 0; i--) {
+                    const nextClose = desiredCloses[i];
+                    const allowedPrevMin = isUp
+                        ? nextClose / (1 + bodyRange.max / 100)
+                        : nextClose / Math.max(1 - bodyRange.max / 100, 0.000001);
+                    const allowedPrevMax = isUp
+                        ? nextClose / (1 + bodyRange.min / 100)
+                        : nextClose / Math.max(1 - bodyRange.min / 100, 0.000001);
+
+                    desiredCloses[i - 1] = clampValue(
+                        desiredCloses[i - 1],
+                        Math.min(allowedPrevMin, allowedPrevMax),
+                        Math.max(allowedPrevMin, allowedPrevMax)
+                    );
+                }
+
+                const rebuiltCandles = [];
+                let prevClose = startPrice;
+
+                for (let i = 0; i <= lastIndex; i++) {
+                    const open = i === 0 ? startPrice : prevClose;
+                    const targetClose = i === lastIndex ? targetPrice : desiredCloses[i];
+                    const rebuilt = buildCandle(
+                        open,
+                        targetClose,
+                        minWickChange,
+                        maxWickChange,
+                        bodyRange.min,
+                        bodyRange.max
+                    );
+
+                    if (i === lastIndex) {
+                        rebuilt[1] = targetPrice;
+                    }
+
+                    rebuilt[2] = Math.min(rebuilt[2], rebuilt[0], rebuilt[1]);
+                    rebuilt[3] = Math.max(rebuilt[3], rebuilt[0], rebuilt[1]);
+                    rebuiltCandles.push(rebuilt);
+                    prevClose = rebuilt[1];
+                    desiredCloses[i] = rebuilt[1];
+                }
+
+                candles = rebuiltCandles;
+            }
+
+            return candles;
+        }
+
+        function enforceSingleCandleBodyRange(candles, minChange, maxChange, minWickChange, maxWickChange, trendType, startPrice, targetPrice) {
+            if (!Array.isArray(candles) || candles.length === 0) {
+                return candles;
+            }
+
+            const bodyRange = normalizeAbsolutePercentRange(minChange, maxChange);
+            const fixed = [];
+
+            for (let i = 0; i < candles.length; i++) {
+                const isFirst = i === 0;
+                const isLast = i === candles.length - 1;
+                const source = Array.isArray(candles[i]) ? candles[i] : [startPrice, startPrice, startPrice, startPrice];
+                const open = isFirst ? source[0] : fixed[i - 1][1];
+                let close = source[1];
+                const currentBodyPct = open !== 0 ? Math.abs((close - open) / open * 100) : 0;
+
+                if (currentBodyPct + 0.000001 < bodyRange.min) {
+                    let direction = close >= open ? 1 : -1;
+                    if (trendType === 'up') {
+                        direction = 1;
+                    } else if (trendType === 'down') {
+                        direction = -1;
+                    } else if (direction === 0) {
+                        direction = i % 2 === 0 ? 1 : -1;
+                    }
+
+                    close = open * (1 + direction * bodyRange.min / 100);
+                }
+
+                const rebuilt = buildCandle(open, close, minWickChange, maxWickChange, bodyRange.min, bodyRange.max);
+
+                if (trendType === 'up') {
+                    if (isFirst) {
+                        rebuilt[0] = startPrice;
+                        rebuilt[2] = startPrice;
+                    }
+                    if (isLast) {
+                        rebuilt[1] = targetPrice;
+                        rebuilt[3] = Math.max(rebuilt[3], targetPrice);
+                    }
+                } else if (trendType === 'down') {
+                    if (isFirst) {
+                        rebuilt[0] = startPrice;
+                        rebuilt[3] = startPrice;
+                    }
+                    if (isLast) {
+                        rebuilt[1] = targetPrice;
+                        rebuilt[2] = Math.min(rebuilt[2], targetPrice);
+                    }
+                }
+
+                rebuilt[2] = Math.min(rebuilt[2], rebuilt[0], rebuilt[1]);
+                rebuilt[3] = Math.max(rebuilt[3], rebuilt[0], rebuilt[1]);
+                fixed.push(rebuilt);
+            }
+
+            return alignTerminalCandleBodyRange(fixed, bodyRange, minWickChange, maxWickChange, trendType, startPrice, targetPrice);
+        }
         
         function isChangeWithinRange(prevPrice, nextPrice, minTickChange, maxTickChange) {
             const tickRange = normalizeAbsolutePercentRange(minTickChange, maxTickChange);
@@ -1203,18 +1336,61 @@
                         : (1 - minTickChange / 100)
                 );
 
-                adjusted[i] = projectPriceIntoBounds(
+                let projectedPrice = projectFlexibleMinutePrice(
                     prevPrice,
                     nudgedCandidate,
                     endPrice,
                     remainingSteps,
-                    preferredDirection,
                     minTickChange,
-                    maxTickChange
+                    maxTickChange,
+                    low,
+                    high
                 );
+
+                if (!isChangeWithinRange(prevPrice, projectedPrice, minTickChange, maxTickChange)) {
+                    projectedPrice = projectPriceFromPrevious(
+                        prevPrice,
+                        projectedPrice,
+                        minTickChange,
+                        maxTickChange,
+                        low,
+                        high
+                    );
+                }
+
+                adjusted[i] = clampValue(projectedPrice, low, high);
             }
 
             adjusted[adjusted.length - 1] = endPrice;
+
+            for (let i = 1; i < adjusted.length; i++) {
+                if (isChangeWithinRange(adjusted[i - 1], adjusted[i], minTickChange, maxTickChange)) {
+                    continue;
+                }
+
+                if (i === adjusted.length - 1) {
+                    adjusted[i - 1] = projectPriceFromNext(
+                        adjusted[i - 1],
+                        adjusted[i],
+                        minTickChange,
+                        maxTickChange,
+                        low,
+                        high
+                    );
+                } else {
+                    adjusted[i] = projectFlexibleMinutePrice(
+                        adjusted[i - 1],
+                        adjusted[i],
+                        endPrice,
+                        adjusted.length - i,
+                        minTickChange,
+                        maxTickChange,
+                        low,
+                        high
+                    );
+                }
+            }
+
             return adjusted;
         }
 
@@ -1288,6 +1464,14 @@
                 profile.pullbackRatio = 0.16;
                 profile.burstBias = 0.62;
             }
+            if (styleName.includes('事件冲击')) {
+                profile.waveStrength = 0.3;
+                profile.jitterStrength = 0.18;
+                profile.acceleration = 0.2;
+                profile.kernel = 'event_shock';
+                profile.pullbackRatio = 0.16;
+                profile.burstBias = 0.68;
+            }
             if (styleName.includes('马尔可夫') || styleName.includes('多因子') || styleName.includes('随机游走')) {
                 profile.waveStrength = 0.24;
                 profile.jitterStrength = 0.16;
@@ -1295,11 +1479,33 @@
                 profile.kernel = 'regime_switch';
                 profile.pullbackRatio = 0.24;
             }
+            if (styleName.includes('分数布朗')) {
+                profile.waveStrength = 0.18;
+                profile.jitterStrength = 0.1;
+                profile.kernel = 'trend_follow';
+                profile.pullbackRatio = 0.2;
+            }
+            if (styleName.includes('Copula')) {
+                profile.waveStrength = 0.22;
+                profile.jitterStrength = 0.14;
+                profile.progressBias = trendType === 'pureDown' ? 0.42 : 0.58;
+                profile.kernel = 'regime_switch';
+                profile.pullbackRatio = 0.22;
+            }
             if (styleName.includes('小波') || styleName.includes('扩散')) {
                 profile.waveStrength = 0.22;
                 profile.jitterStrength = 0.1;
                 profile.kernel = styleName.includes('小波') ? 'wavelet' : 'diffusion';
                 profile.pullbackRatio = styleName.includes('小波') ? 0.23 : 0.14;
+            }
+            if (styleName.includes('通道突破')) {
+                profile.highBias = 0.18;
+                profile.lowBias = 0.82;
+                profile.progressBias = 0.36;
+                profile.waveStrength = 0.14;
+                profile.kernel = 'breakdown';
+                profile.pullbackRatio = 0.28;
+                profile.burstBias = 0.68;
             }
             if (styleName.includes('高位横盘破位下跌')) {
                 profile.highBias = 0.16;
@@ -3120,6 +3326,100 @@
             };
         }
 
+        const PROFESSIONAL_MODEL_CATALOG = {
+            up: [
+                { name: '马尔可夫状态切换模型', fn: generateMarkovSwitchingUpTrend },
+                { name: '分数布朗运动模型', fn: generateFractionalGBMUpTrend },
+                { name: '泊松跳跃扩散模型', fn: generatePoissonUpTrend },
+                { name: 'Copula相关模型', fn: generateCopulaUpTrend },
+                { name: '小波分解模型', fn: generateWaveletUpTrend },
+                { name: 'ARMA-GARCH模型', fn: generateARMAUpTrend },
+                { name: '扩散模型', fn: generateDiffusionUpTrend }
+            ],
+            down: [
+                { name: '事件冲击模型', fn: generateThreeStageDownTrend },
+                { name: '通道突破模型', fn: generateBreakdownDownTrend },
+                { name: '均值回归模型', fn: generateBounceDownTrend },
+                { name: 'GARCH波动率聚集模型', fn: generateExtremeDownTrend }
+            ],
+            flat: [
+                { name: '均值回归模型', fn: generateRandomFlatTrend },
+                { name: '小波分解模型', fn: generateBoxFlatTrend },
+                { name: '马尔可夫状态切换模型', fn: generateTriangleFlatTrend },
+                { name: '扩散模型', fn: generateNarrowFlatTrend }
+            ]
+        };
+
+        function getProfessionalModelsByTrend(trendKey) {
+            if (!trendKey || !Array.isArray(PROFESSIONAL_MODEL_CATALOG[trendKey])) {
+                return [];
+            }
+            return PROFESSIONAL_MODEL_CATALOG[trendKey];
+        }
+
+        function getTrendKeyFromTargetPctValue(targetPctValue) {
+            const numericValue = Number(targetPctValue);
+            if (!Number.isFinite(numericValue) || numericValue === 0) {
+                return 'flat';
+            }
+            return numericValue > 0 ? 'up' : 'down';
+        }
+
+        function getCurrentFormTrendKey() {
+            const targetPctInput = document.getElementById('targetPct');
+            return getTrendKeyFromTargetPctValue(targetPctInput ? targetPctInput.value : 0);
+        }
+
+        function populateModelOptionsForTrend(trendKey, preferredValue) {
+            const select = document.getElementById('selectedModel');
+            if (!select) {
+                return;
+            }
+
+            const availableModels = getProfessionalModelsByTrend(trendKey);
+            const previousValue = preferredValue !== undefined ? preferredValue : select.value;
+
+            select.innerHTML = '';
+
+            const randomOption = document.createElement('option');
+            randomOption.value = '';
+            randomOption.textContent = '随机（按当前趋势）';
+            select.appendChild(randomOption);
+
+            availableModels.forEach(model => {
+                const option = document.createElement('option');
+                option.value = model.name;
+                option.textContent = model.name;
+                select.appendChild(option);
+            });
+
+            const matched = availableModels.some(model => model.name === previousValue);
+            select.value = matched ? previousValue : '';
+            select.dataset.trendKey = trendKey;
+        }
+
+        function syncModelSelectorByCurrentInput(preferredValue) {
+            populateModelOptionsForTrend(getCurrentFormTrendKey(), preferredValue);
+        }
+
+        function pickProfessionalModel(trendKey) {
+            const availableModels = getProfessionalModelsByTrend(trendKey);
+            if (availableModels.length === 0) {
+                return null;
+            }
+
+            const select = document.getElementById('selectedModel');
+            const selectedName = select ? String(select.value || '').trim() : '';
+            if (selectedName) {
+                const matchedModel = availableModels.find(model => model.name === selectedName);
+                if (matchedModel) {
+                    return matchedModel;
+                }
+            }
+
+            return availableModels[Math.floor(Math.random() * availableModels.length)];
+        }
+
         function readFormConfig() {
             return {
                 startPrice: parseFloat(document.getElementById('startPrice').value),
@@ -3138,7 +3438,8 @@
                 minAmount: parseInt(document.getElementById('minAmount').value),
                 maxAmount: parseInt(document.getElementById('maxAmount').value),
                 minTickChange: parseFloat(document.getElementById('minTickChange').value),
-                maxTickChange: parseFloat(document.getElementById('maxTickChange').value)
+                maxTickChange: parseFloat(document.getElementById('maxTickChange').value),
+                selectedModel: document.getElementById('selectedModel') ? document.getElementById('selectedModel').value : ''
             };
         }
 
@@ -3288,6 +3589,84 @@
             steps[stepCount - 1] += diff;
 
             return steps;
+        }
+
+        function buildMinuteDetailsFromAnchors(open, high, low, close, segments, totalTicks, avgAmountPerTick, styleProfile, minTickChange, maxTickChange) {
+            const epsilon = 0.000001;
+            const anchors = [{ index: 0, price: open, name: '开盘价' }];
+            let cumulativeIndex = 0;
+
+            for (const segment of segments) {
+                cumulativeIndex += segment.ticks;
+                anchors.push({
+                    index: cumulativeIndex,
+                    price: segment.end,
+                    name: segment.name
+                });
+            }
+
+            const expectedLastIndex = Math.max(totalTicks - 1, 0);
+            if (anchors.length === 0 || anchors[anchors.length - 1].index !== expectedLastIndex) {
+                return null;
+            }
+
+            const highAnchor = anchors.find(anchor => Math.abs(anchor.price - high) < epsilon);
+            const lowAnchor = anchors.find(anchor => Math.abs(anchor.price - low) < epsilon);
+            const highAnchorIndex = highAnchor ? highAnchor.index : -1;
+            const lowAnchorIndex = lowAnchor ? lowAnchor.index : -1;
+            const details = [{
+                index: 1,
+                price: open,
+                amount: Math.round(avgAmountPerTick),
+                changePercent: 0,
+                originalChangePercent: 0,
+                compliant: true
+            }];
+
+            let absoluteStartIndex = 0;
+            for (const segment of segments) {
+                if (segment.ticks <= 0) {
+                    continue;
+                }
+
+                const bridgePrices = buildConstrainedMinuteBridge(
+                    segment.start,
+                    segment.end,
+                    segment.ticks,
+                    segment.dir,
+                    minTickChange,
+                    maxTickChange,
+                    low,
+                    high,
+                    styleProfile,
+                    absoluteStartIndex,
+                    absoluteStartIndex + segment.ticks,
+                    highAnchorIndex,
+                    lowAnchorIndex
+                );
+
+                for (let i = 0; i < bridgePrices.length; i++) {
+                    details.push({
+                        index: details.length + 1,
+                        price: bridgePrices[i],
+                        amount: Math.round(avgAmountPerTick + (Math.random() - 0.5) * avgAmountPerTick * 0.3),
+                        changePercent: 0,
+                        originalChangePercent: 0,
+                        compliant: false
+                    });
+                }
+
+                absoluteStartIndex += segment.ticks;
+            }
+
+            const refreshedDetails = refreshMinuteDetailMetrics(details, minTickChange, maxTickChange);
+            const validation = validateMinuteDetailSeries(refreshedDetails, open, high, low, close, minTickChange, maxTickChange);
+
+            return {
+                details: refreshedDetails,
+                anchors,
+                validation
+            };
         }
 
         // 生成标准20种1分钟股票走势
@@ -3445,18 +3824,8 @@
             );
             console.log(`形态名称: ${pattern.name}, 骨架: ${pattern.skeleton}, 结构: ${pattern.structure}`);
 
-            // 5. 生成价格序列
+            // 5. 价格锚点先由开高低收确定，后续只按锚点位置串联
             let details = [];
-            let currentPrice = open;
-
-            details.push({
-                index: 1,
-                price: open,
-                amount: Math.round(avgAmountPerTick),
-                changePercent: 0,
-                originalChangePercent: 0,
-                compliant: true
-            });
 
             // 6. 确定骨架
             let skeletonType = pattern.skeleton;
@@ -3524,8 +3893,6 @@
                 segments.push({ ...segment1, ticks: segment1Ticks });
             }
 
-            segments.push({ ...segment2, ticks: segment2Ticks });
-
             if (skeletonType === '第一组' && closeEqualsHigh) {
                 console.log(`第三段收=高，合并到第二段`);
                 segment2.end = close;
@@ -3540,79 +3907,64 @@
                 segments.push({ ...segment3, ticks: segment3Ticks });
             }
 
+            segments.splice(segment1Ticks > 0 ? 1 : 0, 0, { ...segment2, ticks: segment2Ticks });
+
             console.log(`实际段数: ${segments.length}`);
 
-            // 11. 生成每段价格
-            let tickIndex = 2;
-
-            for (let segIdx = 0; segIdx < segments.length; segIdx++) {
-                const seg = segments[segIdx];
-                const segTicks = seg.ticks;
-
-                if (segTicks === 0) continue;
-
-                const modeledSegments = createModeledMinuteSegments(
-                    seg,
-                    segTicks,
-                    styleProfile,
-                    low,
+            // 11. 先确定开高低收位置，再按段串联整分钟价格
+            let generatedMinute = null;
+            for (let attempt = 0; attempt < 8; attempt++) {
+                generatedMinute = buildMinuteDetailsFromAnchors(
+                    open,
                     high,
+                    low,
+                    close,
+                    segments,
+                    totalTicks,
+                    avgAmountPerTick,
+                    styleProfile,
                     minTickChange,
                     maxTickChange
                 );
 
-                for (let modeledIdx = 0; modeledIdx < modeledSegments.length; modeledIdx++) {
-                    const modeledSegment = modeledSegments[modeledIdx];
-                    const modeledTicks = modeledSegment.ticks;
+                if (!generatedMinute) {
+                    continue;
+                }
 
-                    if (modeledTicks <= 0) {
-                        continue;
-                    }
-
-                    const totalChange = modeledSegment.end - modeledSegment.start;
-                    const avgStep = totalChange / modeledTicks;
-                    console.log(`\n${modeledSegment.name}: 起点=${modeledSegment.start}, 终点=${modeledSegment.end}, 笔数=${modeledTicks}, 方向=${modeledSegment.dir === 1 ? '上涨' : '下跌'}, 总变动=${totalChange.toFixed(2)}, 平均步长=${avgStep.toFixed(4)}`);
-
-                    const absoluteStartIndex = details.length - 1;
-                    const bridgePrices = buildConstrainedMinuteBridge(
-                        modeledSegment.start,
-                        modeledSegment.end,
-                        modeledTicks,
-                        modeledSegment.dir,
-                        minTickChange,
-                        maxTickChange,
-                        low,
-                        high,
-                        styleProfile,
-                        absoluteStartIndex,
-                        absoluteStartIndex + modeledTicks,
-                        -1,
-                        -1
-                    );
-                    console.log(`  约束桥接价格: ${bridgePrices.map(price => price.toFixed(4)).join(', ')}`);
-
-                    for (let i = 0; i < modeledTicks; i++) {
-                        const price = bridgePrices[i];
-                        const prevPrice = details[details.length - 1].price;
-                        const changePercent = Math.abs(1 - prevPrice / price) * 100;
-                        const roundedChange = Math.round(changePercent * 100) / 100;
-                        const compliant = isChangeWithinRange(prevPrice, price, minTickChange, maxTickChange);
-
-                        details.push({
-                            index: tickIndex++,
-                            price: price,
-                            amount: Math.round(avgAmountPerTick + (Math.random() - 0.5) * avgAmountPerTick * 0.3),
-                            changePercent: roundedChange,
-                            originalChangePercent: changePercent,
-                            compliant: compliant
-                        });
-                    }
+                if (
+                    generatedMinute.validation.allCompliant &&
+                    generatedMinute.validation.candleMatched &&
+                    generatedMinute.validation.uniqueHigh &&
+                    generatedMinute.validation.uniqueLow
+                ) {
+                    break;
                 }
             }
 
+            if (!generatedMinute) {
+                return {
+                    details: [],
+                    totalVolume: 0,
+                    totalAmount: 0,
+                    highPosition: 0,
+                    lowPosition: 0,
+                    pattern: pattern.name,
+                    skeleton: skeletonType,
+                    actualSegments: segments.length,
+                    maxChange: 0,
+                    minChange: 0,
+                    avgChange: 0,
+                    allCompliant: false,
+                    candleMatched: false,
+                    uniqueHigh: false,
+                    uniqueLow: false
+                };
+            }
+
+            details = generatedMinute.details;
+
             // 12. 统计信息
-            details = alignMinuteDetailsToCandle(details, open, high, low, close, minTickChange, maxTickChange);
-            const validation = validateMinuteDetailSeries(details, open, high, low, close, minTickChange, maxTickChange);
+            const validation = generatedMinute.validation;
             const prices = details.map(d => d.price);
             const actualHigh = validation.actualHigh;
             const actualLow = validation.actualLow;
@@ -4460,6 +4812,7 @@
 
         // 生成下跌趋势
         function generateDownTrend() {
+            populateModelOptionsForTrend('down');
             const startPrice = parseFloat(document.getElementById('startPrice').value);
             const targetPctInput = Math.abs(parseFloat(document.getElementById('targetPct').value) || 0);
             const targetPrice = Math.round(startPrice * (1 - targetPctInput / 100));
@@ -4482,19 +4835,15 @@
             const startMinutes = parseTimeToMinutes(startTime);
             const categories = makeTimeCategories(startMinutes, duration);
             
-            const downStyles = [
-                { name: '阴跌+急跌+反弹三段式', fn: generateThreeStageDownTrend },
-                { name: '高位横盘破位下跌', fn: generateBreakdownDownTrend },
-                { name: '超跌反弹+二次探底', fn: generateBounceDownTrend },
-                { name: '极端波动', fn: generateExtremeDownTrend }
-            ];
-            
             let validData = false;
             let ownCandle = [];
             let attempts = 0;
             
             while (!validData && attempts < 10) {
-                const selected = downStyles[Math.floor(Math.random() * downStyles.length)];
+                const selected = pickProfessionalModel('down');
+                if (!selected) {
+                    break;
+                }
                 currentStyle = selected.name;
                 
                 ownCandle = selected.fn(startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
@@ -4507,6 +4856,7 @@
                 
                 // 校验两条K线之间的涨跌幅
                 ownCandle = enforceTrendExtremaBounds(ownCandle, startPrice, targetPrice, 'down');
+                ownCandle = enforceSingleCandleBodyRange(ownCandle, minChange, maxChange, minWickChange, maxWickChange, 'down', startPrice, targetPrice);
                 ownCandle = enforceUniquePeriodExtrema(ownCandle, 'down', startPrice, targetPrice);
                 validData = validateKLineChanges(ownCandle, minKChange, maxKChange);
                 attempts++;
@@ -4517,6 +4867,7 @@
                 ownCandle = fixKLineChanges(ownCandle, minKChange, maxKChange, minWickChange, maxWickChange);
             }
             ownCandle = enforceTrendExtremaBounds(ownCandle, startPrice, targetPrice, 'down');
+            ownCandle = enforceSingleCandleBodyRange(ownCandle, minChange, maxChange, minWickChange, maxWickChange, 'down', startPrice, targetPrice);
             ownCandle = enforceUniquePeriodExtrema(ownCandle, 'down', startPrice, targetPrice);
             
             currentData = {
@@ -4537,6 +4888,7 @@
 
         // 生成上涨趋势
         function generateUpTrend() {
+            populateModelOptionsForTrend('up');
             const startPrice = parseFloat(document.getElementById('startPrice').value);
             const targetPctInput = Math.abs(parseFloat(document.getElementById('targetPct').value) || 0);
             const targetPrice = Math.round(startPrice * (1 + targetPctInput / 100));
@@ -4559,25 +4911,15 @@
             const startMinutes = parseTimeToMinutes(startTime);
             const categories = makeTimeCategories(startMinutes, duration);
             
-            const upStyles = [
-                { name: '仿射跳跃扩散模型', fn: generateAJDUpTrend },
-                { name: '多因子随机游走模型', fn: generateMultiFactorUpTrend },
-                { name: '马尔可夫切换模型', fn: generateMarkovSwitchingUpTrend },
-                { name: '分数阶几何布朗运动', fn: generateFractionalGBMUpTrend },
-                { name: '泊松点过程模型', fn: generatePoissonUpTrend },
-                { name: 'Copula相依结构模型', fn: generateCopulaUpTrend },
-                { name: '强化学习生成模型', fn: generateRLUpTrend },
-                { name: '小波变换生成模型', fn: generateWaveletUpTrend },
-                { name: '自回归滑动平均模型', fn: generateARMAUpTrend },
-                { name: '扩散模型', fn: generateDiffusionUpTrend }
-            ];
-            
             let validData = false;
             let ownCandle = [];
             let attempts = 0;
             
             while (!validData && attempts < 10) {
-                const selected = upStyles[Math.floor(Math.random() * upStyles.length)];
+                const selected = pickProfessionalModel('up');
+                if (!selected) {
+                    break;
+                }
                 currentStyle = selected.name;
                 
                 ownCandle = selected.fn(startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
@@ -4590,6 +4932,7 @@
                 
                 // 校验两条K线之间的涨跌幅
                 ownCandle = enforceTrendExtremaBounds(ownCandle, startPrice, targetPrice, 'up');
+                ownCandle = enforceSingleCandleBodyRange(ownCandle, minChange, maxChange, minWickChange, maxWickChange, 'up', startPrice, targetPrice);
                 ownCandle = enforceUniquePeriodExtrema(ownCandle, 'up', startPrice, targetPrice);
                 validData = validateKLineChanges(ownCandle, minKChange, maxKChange);
                 attempts++;
@@ -4600,6 +4943,7 @@
                 ownCandle = fixKLineChanges(ownCandle, minKChange, maxKChange, minWickChange, maxWickChange);
             }
             ownCandle = enforceTrendExtremaBounds(ownCandle, startPrice, targetPrice, 'up');
+            ownCandle = enforceSingleCandleBodyRange(ownCandle, minChange, maxChange, minWickChange, maxWickChange, 'up', startPrice, targetPrice);
             ownCandle = enforceUniquePeriodExtrema(ownCandle, 'up', startPrice, targetPrice);
             
             currentData = {
@@ -4620,6 +4964,7 @@
 
         // 生成横盘趋势
         function generateFlatTrend() {
+            populateModelOptionsForTrend('flat');
             const startPrice = parseFloat(document.getElementById('startPrice').value);
             const duration = parseInt(document.getElementById('duration').value);
             const startTime = document.getElementById('startTime').value;
@@ -4634,18 +4979,15 @@
             const minTickChange = parseFloat(document.getElementById('minTickChange').value);
             const maxTickChange = parseFloat(document.getElementById('maxTickChange').value);
             const categories = makeTimeCategories(parseTimeToMinutes(startTime), duration);
-            
-            const flatStyles = [
-                { name: '窄幅织布横盘', fn: generateNarrowFlatTrend },
-                { name: '宽幅箱体震荡', fn: generateBoxFlatTrend },
-                { name: '收敛三角震荡', fn: generateTriangleFlatTrend },
-                { name: '均价缠绕无序震荡', fn: generateRandomFlatTrend }
-            ];
-            
-            const selected = flatStyles[Math.floor(Math.random() * flatStyles.length)];
+
+            const selected = pickProfessionalModel('flat');
+            if (!selected) {
+                return;
+            }
             currentStyle = selected.name;
             let ownCandle = selected.fn(startPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
             ownCandle = fixFlatCandleData(ownCandle, startPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
+            ownCandle = enforceSingleCandleBodyRange(ownCandle, minChange, maxChange, minWickChange, maxWickChange, 'flat', startPrice, startPrice);
             ownCandle = enforceUniquePeriodExtrema(ownCandle, 'flat', startPrice, startPrice);
             
             currentData = {
@@ -5158,6 +5500,10 @@
 
         // 保存配置
         function saveConfig() {
+            if (!enforceDerivedMaximumsBeforeSave()) {
+                return;
+            }
+
             const config = assertConfigRules(readFormConfig(), '保存规则');
             if (!config) {
                 return;
@@ -5199,39 +5545,27 @@
             const startMinutes = parseTimeToMinutes(startTime);
             const categories = makeTimeCategories(startMinutes, duration);
             
-            const isUpTrend = targetPrice > startPrice;
+            const trendKey = targetPrice > startPrice ? 'up' : targetPrice < startPrice ? 'down' : 'flat';
+            populateModelOptionsForTrend(trendKey, formConfig.selectedModel);
             let ownCandle, selected;
             
-            if (isUpTrend) {
-                const upStyles = [
-                    { name: '仿射跳跃扩散模型', fn: generateAJDUpTrend },
-                    { name: '多因子随机游走模型', fn: generateMultiFactorUpTrend },
-                    { name: '马尔可夫切换模型', fn: generateMarkovSwitchingUpTrend },
-                    { name: '分数阶几何布朗运动', fn: generateFractionalGBMUpTrend },
-                    { name: '泊松点过程模型', fn: generatePoissonUpTrend },
-                    { name: 'Copula相依结构模型', fn: generateCopulaUpTrend },
-                    { name: '强化学习生成模型', fn: generateRLUpTrend },
-                    { name: '小波变换生成模型', fn: generateWaveletUpTrend },
-                    { name: '自回归滑动平均模型', fn: generateARMAUpTrend },
-                    { name: '扩散模型', fn: generateDiffusionUpTrend }
-                ];
-                selected = upStyles[Math.floor(Math.random() * upStyles.length)];
+            if (trendKey === 'up') {
+                selected = pickProfessionalModel('up');
                 ownCandle = selected.fn(startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
                 ownCandle = fixUpCandleData(ownCandle, startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
                 ownCandle = enforceTrendExtremaBounds(ownCandle, startPrice, targetPrice, 'up');
                 ownCandle = enforceUniquePeriodExtrema(ownCandle, 'up', startPrice, targetPrice);
-            } else {
-                const downStyles = [
-                    { name: '阴跌+急跌+反弹三段式', fn: generateThreeStageDownTrend },
-                    { name: '高位横盘破位下跌', fn: generateBreakdownDownTrend },
-                    { name: '超跌反弹+二次探底', fn: generateBounceDownTrend },
-                    { name: '极端波动', fn: generateExtremeDownTrend }
-                ];
-                selected = downStyles[Math.floor(Math.random() * downStyles.length)];
+            } else if (trendKey === 'down') {
+                selected = pickProfessionalModel('down');
                 ownCandle = selected.fn(startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
                 ownCandle = fixDownCandleData(ownCandle, startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
                 ownCandle = enforceTrendExtremaBounds(ownCandle, startPrice, targetPrice, 'down');
                 ownCandle = enforceUniquePeriodExtrema(ownCandle, 'down', startPrice, targetPrice);
+            } else {
+                selected = pickProfessionalModel('flat');
+                ownCandle = selected.fn(startPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
+                ownCandle = fixFlatCandleData(ownCandle, startPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
+                ownCandle = enforceUniquePeriodExtrema(ownCandle, 'flat', startPrice, startPrice);
             }
             
             currentStyle = selected.name;
@@ -5247,9 +5581,183 @@
                 maxChange
             };
             
-            renderChart(currentData, isUpTrend ? 'up' : 'down', minVolume, maxVolume, minAmount, maxAmount, minTickChange, maxTickChange);
+            renderChart(currentData, trendKey === 'down' ? 'down' : trendKey === 'flat' ? 'flat' : 'up', minVolume, maxVolume, minAmount, maxAmount, minTickChange, maxTickChange);
         }
         
+        function restoreInputValue(id, value) {
+            const input = document.getElementById(id);
+            if (!input) {
+                return;
+            }
+
+            if (value === null || value === undefined || value === '') {
+                return;
+            }
+
+            const inputType = (input.type || '').toLowerCase();
+            if (inputType === 'number') {
+                const numericValue = Number(value);
+                if (!Number.isFinite(numericValue)) {
+                    return;
+                }
+                input.value = String(numericValue);
+                return;
+            }
+
+            input.value = String(value);
+        }
+
+        function parsePositiveNumberInput(id) {
+            const input = document.getElementById(id);
+            if (!input) {
+                return null;
+            }
+
+            const rawValue = String(input.value || '').trim();
+            if (rawValue === '') {
+                return null;
+            }
+
+            const numericValue = Number(rawValue);
+            return Number.isFinite(numericValue) && numericValue > 0 ? numericValue : null;
+        }
+
+        function parseNonNegativeNumberInput(id) {
+            const input = document.getElementById(id);
+            if (!input) {
+                return null;
+            }
+
+            const rawValue = String(input.value || '').trim();
+            if (rawValue === '') {
+                return null;
+            }
+
+            const numericValue = Number(rawValue);
+            return Number.isFinite(numericValue) && numericValue >= 0 ? numericValue : null;
+        }
+
+        function formatAutoFillValue(value) {
+            if (!Number.isFinite(value)) {
+                return '';
+            }
+            return value.toFixed(4).replace(/\.?0+$/, '');
+        }
+
+        function computeMinuteMaxChangeDefault() {
+            const targetPct = parseNonNegativeNumberInput('targetPct');
+            const duration = parsePositiveNumberInput('duration');
+            if (targetPct === null || duration === null) {
+                return null;
+            }
+            return Math.abs(targetPct) / duration + 0.5;
+        }
+
+        function computeKLineMaxChangeDefault() {
+            const minuteMaxChange = parseNonNegativeNumberInput('maxChange');
+            const minVolume = parsePositiveNumberInput('minVolume');
+            if (minuteMaxChange === null || minVolume === null) {
+                return null;
+            }
+            return Math.abs(minuteMaxChange) / minVolume + 0.05;
+        }
+
+        function applyDerivedDefaultValue(inputId, recommendedValue) {
+            const input = document.getElementById(inputId);
+            if (!input) {
+                return;
+            }
+
+            const currentValue = String(input.value || '').trim();
+            const isAutoFilled = input.dataset.autoFilled === 'true';
+
+            if (!Number.isFinite(recommendedValue) || recommendedValue === null) {
+                if (isAutoFilled || currentValue === '') {
+                    input.value = '';
+                    input.dataset.autoFilled = 'true';
+                }
+                return;
+            }
+
+            if (currentValue === '' || isAutoFilled) {
+                input.value = formatAutoFillValue(recommendedValue);
+                input.dataset.autoFilled = 'true';
+            }
+        }
+
+        function refreshDerivedMaxDefaults() {
+            const minuteMaxDefault = computeMinuteMaxChangeDefault();
+            applyDerivedDefaultValue('maxChange', minuteMaxDefault);
+
+            const kLineMaxDefault = computeKLineMaxChangeDefault();
+            applyDerivedDefaultValue('maxKChange', kLineMaxDefault);
+        }
+
+        function bindDerivedDefaultInput(inputId, onChange) {
+            const input = document.getElementById(inputId);
+            if (!input || input.dataset.boundDefaultWatcher === 'true') {
+                return;
+            }
+
+            input.dataset.boundDefaultWatcher = 'true';
+            input.addEventListener('input', function() {
+                if (inputId === 'maxChange' || inputId === 'maxKChange') {
+                    input.dataset.autoFilled = 'false';
+                }
+                onChange();
+            });
+        }
+
+        function initializeDerivedDefaultBindings() {
+            bindDerivedDefaultInput('targetPct', refreshDerivedMaxDefaults);
+            bindDerivedDefaultInput('duration', refreshDerivedMaxDefaults);
+            bindDerivedDefaultInput('maxChange', refreshDerivedMaxDefaults);
+            bindDerivedDefaultInput('minVolume', refreshDerivedMaxDefaults);
+            bindDerivedDefaultInput('maxKChange', refreshDerivedMaxDefaults);
+            refreshDerivedMaxDefaults();
+        }
+
+        function initializeModelSelectorBindings() {
+            const targetPctInput = document.getElementById('targetPct');
+            if (targetPctInput && targetPctInput.dataset.boundModelWatcher !== 'true') {
+                targetPctInput.dataset.boundModelWatcher = 'true';
+                targetPctInput.addEventListener('input', function() {
+                    syncModelSelectorByCurrentInput();
+                });
+            }
+
+            syncModelSelectorByCurrentInput();
+        }
+
+        function enforceDerivedMaximumsBeforeSave() {
+            const minuteMaxDefault = computeMinuteMaxChangeDefault();
+            const minuteMaxInput = document.getElementById('maxChange');
+            if (minuteMaxInput && Number.isFinite(minuteMaxDefault)) {
+                const currentMinuteMax = parseNonNegativeNumberInput('maxChange');
+                if (currentMinuteMax === null || currentMinuteMax + 0.000001 < minuteMaxDefault) {
+                    minuteMaxInput.value = formatAutoFillValue(minuteMaxDefault);
+                    minuteMaxInput.dataset.autoFilled = 'true';
+                    alert(`保存规则前已自动回填：1分钟K线涨跌幅（%）最大值不能小于 ${formatAutoFillValue(minuteMaxDefault)}，请再次修改。`);
+                    refreshDerivedMaxDefaults();
+                    return false;
+                }
+            }
+
+            const kLineMaxDefault = computeKLineMaxChangeDefault();
+            const kLineMaxInput = document.getElementById('maxKChange');
+            if (kLineMaxInput && Number.isFinite(kLineMaxDefault)) {
+                const currentKLineMax = parseNonNegativeNumberInput('maxKChange');
+                if (currentKLineMax === null || currentKLineMax + 0.000001 < kLineMaxDefault) {
+                    kLineMaxInput.value = formatAutoFillValue(kLineMaxDefault);
+                    kLineMaxInput.dataset.autoFilled = 'true';
+                    alert(`保存规则前已自动回填：相邻K线涨跌幅差（%）最大值不能小于 ${formatAutoFillValue(kLineMaxDefault)}，请再次修改。`);
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
         // 加载保存的配置
         function loadConfig() {
             try {
@@ -5257,23 +5765,25 @@
                 if (saved) {
                     try {
                         const config = JSON.parse(saved);
-                        document.getElementById('startPrice').value = config.startPrice;
-                        document.getElementById('targetPct').value = config.targetPct;
-                        document.getElementById('basePrice').value = config.basePrice;
-                        document.getElementById('duration').value = config.duration;
-                        document.getElementById('startTime').value = config.startTime;
-                        document.getElementById('minChange').value = config.minChange;
-                        document.getElementById('maxChange').value = config.maxChange;
-                        document.getElementById('minKChange').value = config.minKChange;
-                        document.getElementById('maxKChange').value = config.maxKChange;
-                        document.getElementById('minWickChange').value = config.minWickChange;
-                        document.getElementById('maxWickChange').value = config.maxWickChange;
-                        document.getElementById('minVolume').value = config.minVolume;
-                        document.getElementById('maxVolume').value = config.maxVolume;
-                        document.getElementById('minAmount').value = config.minAmount;
-                        document.getElementById('maxAmount').value = config.maxAmount;
-                        document.getElementById('minTickChange').value = config.minTickChange;
-                        document.getElementById('maxTickChange').value = config.maxTickChange;
+                        restoreInputValue('startPrice', config.startPrice);
+                        restoreInputValue('targetPct', config.targetPct);
+                        restoreInputValue('basePrice', config.basePrice);
+                        restoreInputValue('duration', config.duration);
+                        restoreInputValue('startTime', config.startTime);
+                        restoreInputValue('minChange', config.minChange);
+                        restoreInputValue('maxChange', config.maxChange);
+                        restoreInputValue('minKChange', config.minKChange);
+                        restoreInputValue('maxKChange', config.maxKChange);
+                        restoreInputValue('minWickChange', config.minWickChange);
+                        restoreInputValue('maxWickChange', config.maxWickChange);
+                        restoreInputValue('minVolume', config.minVolume);
+                        restoreInputValue('maxVolume', config.maxVolume);
+                        restoreInputValue('minAmount', config.minAmount);
+                        restoreInputValue('maxAmount', config.maxAmount);
+                        restoreInputValue('minTickChange', config.minTickChange);
+                        restoreInputValue('maxTickChange', config.maxTickChange);
+                        syncModelSelectorByCurrentInput(config.selectedModel);
+                        restoreInputValue('selectedModel', config.selectedModel);
                     } catch (e) {
                         console.error('加载配置失败:', e);
                     }
@@ -5285,6 +5795,8 @@
         
         // 初始化加载配置
         loadConfig();
+        initializeDerivedDefaultBindings();
+        initializeModelSelectorBindings();
         
         // 初始生成一个上涨趋势
         generateUpTrend();
