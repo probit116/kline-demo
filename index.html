@@ -417,6 +417,14 @@
                     <label>最高涨跌幅(%)</label>
                     <input type="number" id="maxTickChange" value="0.25" min="0" step="0.01">
                 </div>
+
+                <div class="form-row">
+                    <label>分钟曲线增强</label>
+                    <label style="display:flex;align-items:center;gap:8px;color:#ccc;min-width:auto;">
+                        <input type="checkbox" id="allowMinuteFakeBreak">
+                        允许假破（默认关闭，仅在分钟明细与K线同步放开时生效）
+                    </label>
+                </div>
                 
                 <div class="action-buttons">
                     <button class="btn-save" onclick="saveConfig()">保存规则</button>
@@ -608,6 +616,31 @@
     <script>
         let currentData = null;
         let currentStyle = '';
+        let minuteCurveOptions = {
+            allowFakeBreak: false
+        };
+
+        function isMinuteFakeBreakEnabled() {
+            return Boolean(minuteCurveOptions && minuteCurveOptions.allowFakeBreak);
+        }
+
+        function syncMinuteCurveOptionsFromForm() {
+            const fakeBreakInput = document.getElementById('allowMinuteFakeBreak');
+            minuteCurveOptions.allowFakeBreak = Boolean(fakeBreakInput && fakeBreakInput.checked);
+            return minuteCurveOptions;
+        }
+
+        function getMinuteFakeBreakPercent() {
+            const minTickInput = document.getElementById('minTickChange');
+            const maxTickInput = document.getElementById('maxTickChange');
+            const configuredMin = Math.max(0.01, Number(minTickInput ? minTickInput.value : 0) || 0.01);
+            const configuredMax = Math.max(
+                configuredMin,
+                Number(maxTickInput ? maxTickInput.value : configuredMin) || configuredMin
+            );
+            const cappedMax = Math.max(configuredMin, Math.min(configuredMax, configuredMin + 0.08));
+            return configuredMin + Math.random() * (cappedMax - configuredMin);
+        }
         
         // 初始化切换按钮事件
         document.addEventListener('DOMContentLoaded', function() {
@@ -712,23 +745,29 @@
             const wickMaxPercent = Math.max(wickMinPercent, maxWickChange || wickMinPercent);
             const bodyTop = Math.max(open, close);
             const bodyBottom = Math.min(open, close);
-            const maxHigh = open * (1 + maxChange / 100);
-            const minLow = open * (1 - maxChange / 100);
+            const minVisibleWick = wickMaxPercent > 0
+                ? Math.max(Math.abs(open) * 0.00005, 0.01)
+                : 0;
             
-            // 高低点范围按页面百分比配置生成，且不能超过该根K线配置上限
+            // 影线预算和实体预算分开，避免实体吃满后把影线挤没。
             const highWickPercent = wickMinPercent + Math.random() * (wickMaxPercent - wickMinPercent);
             const lowWickPercent = wickMinPercent + Math.random() * (wickMaxPercent - wickMinPercent);
-            let high = bodyTop * (1 + highWickPercent / 100);
-            let low = bodyBottom * (1 - lowWickPercent / 100);
-            
-            high = clampValue(high, bodyTop, maxHigh);
-            low = clampValue(low, minLow, bodyBottom);
+            let high = bodyTop + Math.max(bodyTop * (highWickPercent / 100), minVisibleWick);
+            let low = bodyBottom - Math.max(bodyBottom * (lowWickPercent / 100), minVisibleWick);
+            const allowFakeBreak = isMinuteFakeBreakEnabled();
 
             // 1分钟K线口径：涨则开盘价原则上为最低价，跌则开盘价原则上为最高价
             if (isUpCandle) {
-                low = open;
+                low = allowFakeBreak
+                    ? Math.min(open, open * (1 - getMinuteFakeBreakPercent() / 100))
+                    : open;
+                high = Math.max(high, bodyTop + minVisibleWick);
             } else if (isDownCandle) {
                 high = open;
+                if (allowFakeBreak) {
+                    low = Math.min(close, close * (1 - getMinuteFakeBreakPercent() / 100));
+                }
+                low = Math.min(low, bodyBottom - minVisibleWick);
             }
             
             return [open, close, low, high];
@@ -1261,6 +1300,18 @@
                 fixed.push(rebuilt);
             }
 
+            if (trendType === 'up') {
+                const hasOpposite = fixed.some(candle => candle[1] < candle[0]);
+                if (hasOpposite) {
+                    return fixed;
+                }
+            } else if (trendType === 'down') {
+                const hasOpposite = fixed.some(candle => candle[1] > candle[0]);
+                if (hasOpposite) {
+                    return fixed;
+                }
+            }
+
             return alignTerminalCandleBodyRange(fixed, bodyRange, minWickChange, maxWickChange, trendType, startPrice, targetPrice);
         }
         
@@ -1471,6 +1522,94 @@
 
             return details;
         }
+
+        function suppressMinuteDeepVSwings(details, fixedIndices, minTickChange, maxTickChange, low, high) {
+            if (!Array.isArray(details) || details.length < 6) {
+                return details;
+            }
+
+            const epsilon = 0.000001;
+            const trendDirection = Math.sign(details[details.length - 1].price - details[0].price);
+
+            for (let pass = 0; pass < 2; pass++) {
+                for (let i = 2; i < details.length - 2; i++) {
+                    if (fixedIndices && fixedIndices.has(i)) {
+                        continue;
+                    }
+
+                    const prevPrevPrice = details[i - 2].price;
+                    const prevPrice = details[i - 1].price;
+                    const currentPrice = details[i].price;
+                    const nextPrice = details[i + 1].price;
+                    const nextNextPrice = details[i + 2].price;
+
+                    const firstLeg = currentPrice - prevPrice;
+                    const secondLeg = nextPrice - currentPrice;
+                    if (Math.sign(firstLeg) === 0 || Math.sign(secondLeg) === 0 || Math.sign(firstLeg) !== -Math.sign(secondLeg)) {
+                        continue;
+                    }
+
+                    const localPeak = currentPrice > prevPrice && currentPrice > nextPrice;
+                    const localTrough = currentPrice < prevPrice && currentPrice < nextPrice;
+                    if (!localPeak && !localTrough) {
+                        continue;
+                    }
+
+                    const legAmplitude = Math.max(Math.abs(firstLeg), Math.abs(secondLeg));
+                    const windowNet = Math.abs(nextNextPrice - prevPrevPrice);
+                    const compressedWindow = windowNet <= legAmplitude * 0.9;
+                    const againstTrend = trendDirection < 0 ? localPeak : trendDirection > 0 ? localTrough : true;
+                    const sharpTurn = isChangeWithinRange(prevPrice, currentPrice, minTickChange, maxTickChange)
+                        && isChangeWithinRange(currentPrice, nextPrice, minTickChange, maxTickChange);
+
+                    if (!sharpTurn || (!compressedWindow && !againstTrend)) {
+                        continue;
+                    }
+
+                    let targetPrice = (prevPrice + nextPrice) / 2;
+                    const minMove = Math.max(Math.abs(prevPrice) * (minTickChange / 100), Math.abs(nextPrice) * (minTickChange / 100));
+
+                    if (trendDirection < 0 && localPeak) {
+                        targetPrice = Math.min(targetPrice, Math.max(prevPrice, nextPrice) - minMove * 0.35);
+                    } else if (trendDirection > 0 && localTrough) {
+                        targetPrice = Math.max(targetPrice, Math.min(prevPrice, nextPrice) + minMove * 0.35);
+                    }
+
+                    let projected = projectPriceFromPrevious(
+                        prevPrice,
+                        targetPrice,
+                        minTickChange,
+                        maxTickChange,
+                        low,
+                        high
+                    );
+                    projected = projectPriceFromNext(
+                        projected,
+                        nextPrice,
+                        minTickChange,
+                        maxTickChange,
+                        low,
+                        high
+                    );
+
+                    if (Math.abs(projected - prevPrice) < epsilon || Math.abs(projected - nextPrice) < epsilon) {
+                        const fallbackDirection = trendDirection || (localPeak ? -1 : 1);
+                        projected = projectPriceFromPrevious(
+                            prevPrice,
+                            prevPrice * (1 + fallbackDirection * minTickChange / 100),
+                            minTickChange,
+                            maxTickChange,
+                            low,
+                            high
+                        );
+                    }
+
+                    details[i].price = clampValue(projected, low, high);
+                }
+            }
+
+            return details;
+        }
         
         function getSegmentDirection(startPrice, endPrice, fallbackDirection = 0) {
             const epsilon = 0.000001;
@@ -1481,17 +1620,20 @@
         }
         
         function getMinuteStyleProfile(styleName, trendType) {
+            const isFlatTrend = trendType === 'flat';
+            const isDownTrend = trendType === 'pureDown' || trendType === 'minuteDown';
+            const isUpTrend = !isFlatTrend && !isDownTrend;
             const profile = {
                 styleName: styleName || '',
-                highBias: trendType === 'pureDown' ? 0.24 : 0.72,
-                lowBias: trendType === 'pureDown' ? 0.76 : 0.28,
-                progressBias: 0.5,
-                waveStrength: 0.18,
-                jitterStrength: 0.12,
+                highBias: isDownTrend ? 0.2 : 0.82,
+                lowBias: isDownTrend ? 0.82 : 0.18,
+                progressBias: isDownTrend ? 0.42 : 0.58,
+                waveStrength: isFlatTrend ? 0.1 : 0.14,
+                jitterStrength: isFlatTrend ? 0.08 : 0.06,
                 acceleration: 0.1,
-                kernel: 'trend_follow',
-                pullbackRatio: trendType === 'normal' ? 0.26 : 0.2,
-                burstBias: 0.52
+                kernel: isFlatTrend ? 'mean_revert' : (isDownTrend ? 'stair_down' : 'stair_up'),
+                pullbackRatio: isFlatTrend ? 0.24 : 0.14,
+                burstBias: isDownTrend ? 0.38 : 0.64
             };
             
             if (!styleName) {
@@ -1607,6 +1749,26 @@
                 profile.pullbackRatio = 0.3;
                 profile.burstBias = 0.7;
             }
+
+            if (isUpTrend) {
+                profile.kernel = 'stair_up';
+                profile.highBias = Math.max(profile.highBias, 0.82);
+                profile.lowBias = Math.min(profile.lowBias, 0.18);
+                profile.progressBias = 0.6;
+                profile.waveStrength = Math.min(Math.max(profile.waveStrength, 0.12), 0.18);
+                profile.jitterStrength = Math.min(Math.max(profile.jitterStrength, 0.04), 0.08);
+                profile.pullbackRatio = Math.min(Math.max(profile.pullbackRatio, 0.12), 0.18);
+                profile.burstBias = Math.max(profile.burstBias, 0.64);
+            } else if (isDownTrend) {
+                profile.kernel = 'stair_down';
+                profile.highBias = Math.min(profile.highBias, 0.2);
+                profile.lowBias = Math.max(profile.lowBias, 0.82);
+                profile.progressBias = 0.4;
+                profile.waveStrength = Math.min(Math.max(profile.waveStrength, 0.12), 0.18);
+                profile.jitterStrength = Math.min(Math.max(profile.jitterStrength, 0.04), 0.08);
+                profile.pullbackRatio = Math.min(Math.max(profile.pullbackRatio, 0.12), 0.18);
+                profile.burstBias = Math.min(profile.burstBias, 0.4);
+            }
             
             return profile;
         }
@@ -1651,6 +1813,46 @@
         function getMinutePhaseBlueprint(styleProfile, segment, totalTicks) {
             const kernel = styleProfile && styleProfile.kernel ? styleProfile.kernel : 'trend_follow';
             const shortBlueprint = totalTicks < 10;
+
+            if (kernel === 'stair_up') {
+                return shortBlueprint
+                    ? [
+                        { progress: 0.16, bias: 0.22, weight: 0.16 },
+                        { progress: 0.38, bias: 0.54, weight: 0.26 },
+                        { progress: 0.62, bias: -0.12, weight: 0.16 },
+                        { progress: 0.82, bias: 0.28, weight: 0.18 },
+                        { progress: 1, bias: 0, weight: 0.28 }
+                    ]
+                    : [
+                        { progress: 0.12, bias: 0.18, weight: 0.12 },
+                        { progress: 0.28, bias: 0.36, weight: 0.18 },
+                        { progress: 0.46, bias: -0.12, weight: 0.12 },
+                        { progress: 0.62, bias: 0.22, weight: 0.14 },
+                        { progress: 0.8, bias: 0.46, weight: 0.18 },
+                        { progress: 0.92, bias: -0.08, weight: 0.08 },
+                        { progress: 1, bias: 0, weight: 0.18 }
+                    ];
+            }
+
+            if (kernel === 'stair_down') {
+                return shortBlueprint
+                    ? [
+                        { progress: 0.16, bias: 0.24, weight: 0.16 },
+                        { progress: 0.38, bias: 0.56, weight: 0.26 },
+                        { progress: 0.62, bias: -0.12, weight: 0.16 },
+                        { progress: 0.82, bias: 0.3, weight: 0.18 },
+                        { progress: 1, bias: 0, weight: 0.28 }
+                    ]
+                    : [
+                        { progress: 0.12, bias: 0.2, weight: 0.12 },
+                        { progress: 0.28, bias: 0.4, weight: 0.18 },
+                        { progress: 0.46, bias: -0.12, weight: 0.12 },
+                        { progress: 0.62, bias: 0.24, weight: 0.14 },
+                        { progress: 0.8, bias: 0.48, weight: 0.18 },
+                        { progress: 0.92, bias: -0.08, weight: 0.08 },
+                        { progress: 1, bias: 0, weight: 0.18 }
+                    ];
+            }
 
             if (kernel === 'weave') {
                 return shortBlueprint
@@ -1773,6 +1975,46 @@
                 ];
         }
 
+        function normalizeMinuteBlueprintForTrend(blueprint, styleProfile) {
+            if (!Array.isArray(blueprint) || blueprint.length === 0) {
+                return [];
+            }
+
+            const kernel = styleProfile && styleProfile.kernel ? styleProfile.kernel : 'trend_follow';
+            const counterLimit = (kernel === 'mean_revert' || kernel === 'regime_switch' || kernel === 'volatility_cluster' || kernel === 'wavelet')
+                ? 2
+                : 1;
+            const maxCounterBias = kernel === 'mean_revert'
+                ? 0.22
+                : (kernel === 'regime_switch' || kernel === 'volatility_cluster' || kernel === 'wavelet')
+                    ? 0.18
+                    : (kernel === 'event_shock' || kernel === 'breakdown')
+                        ? 0.16
+                        : 0.14;
+            const minTrendBias = kernel === 'diffusion' ? 0.06 : 0.1;
+            let counterCount = 0;
+
+            return blueprint.map((endpoint, index) => {
+                if (!endpoint || index === blueprint.length - 1) {
+                    return endpoint ? { ...endpoint } : endpoint;
+                }
+
+                const nextEndpoint = { ...endpoint };
+                if (nextEndpoint.bias < 0) {
+                    counterCount += 1;
+                    if (counterCount > counterLimit) {
+                        nextEndpoint.bias = minTrendBias * sampleRange(0.8, 1.2);
+                    } else {
+                        nextEndpoint.bias = -Math.min(Math.abs(nextEndpoint.bias), maxCounterBias);
+                    }
+                } else if (nextEndpoint.bias > 0) {
+                    nextEndpoint.bias = Math.max(nextEndpoint.bias, minTrendBias);
+                }
+
+                return nextEndpoint;
+            });
+        }
+
         function trimMinuteBlueprint(blueprint, maxSegments) {
             if (!Array.isArray(blueprint) || blueprint.length === 0) {
                 return [];
@@ -1803,6 +2045,159 @@
             }
 
             return [...selected, finalEndpoint];
+        }
+
+        function isSmoothMinuteKernel(styleProfile) {
+            const kernel = styleProfile && styleProfile.kernel ? styleProfile.kernel : '';
+            return kernel === 'stair_up'
+                || kernel === 'stair_down'
+                || kernel === 'trend_follow'
+                || kernel === 'diffusion'
+                || kernel === 'wavelet'
+                || kernel === 'regime_switch'
+                || kernel === 'volatility_cluster';
+        }
+
+        function getMinutePullbackWindow(totalSteps, styleProfile) {
+            if (totalSteps < 12 || !isSmoothMinuteKernel(styleProfile)) {
+                return null;
+            }
+
+            const kernel = styleProfile && styleProfile.kernel ? styleProfile.kernel : '';
+            const width = 2;
+            const center = kernel === 'diffusion'
+                ? Math.round(totalSteps * 0.62)
+                : kernel === 'trend_follow'
+                    ? Math.round(totalSteps * 0.48)
+                    : Math.round(totalSteps * 0.52);
+            const depthFactor = kernel === 'diffusion'
+                ? 0.05
+                : kernel === 'trend_follow'
+                    ? 0.07
+                    : 0.09;
+
+            return {
+                start: Math.max(2, center - 1),
+                end: Math.min(totalSteps - 1, center - 1 + width),
+                depthFactor
+            };
+        }
+
+        function buildSmoothMinuteBridge(startPrice, endPrice, totalSteps, direction, minTickChange, maxTickChange, low, high, styleProfile, absoluteStartIndex, absoluteEndIndex, highAnchorIndex, lowAnchorIndex) {
+            const prices = [];
+            const epsilon = 0.000001;
+            const totalMove = endPrice - startPrice;
+            const span = Math.abs(totalMove);
+            const pullbackWindow = getMinutePullbackWindow(totalSteps, styleProfile);
+            const pullbackDepth = pullbackWindow
+                ? Math.max(
+                    span * pullbackWindow.depthFactor,
+                    Math.abs(startPrice) * (minTickChange / 100) * 1.05
+                )
+                : 0;
+            const phase1EndStep = pullbackWindow
+                ? Math.max(2, pullbackWindow.start - 1)
+                : Math.max(2, Math.round(totalSteps * 0.62));
+            const phase2EndStep = pullbackWindow
+                ? Math.max(phase1EndStep + 1, pullbackWindow.end)
+                : Math.max(phase1EndStep + 1, Math.round(totalSteps * 0.76));
+            const phase1TargetRatio = totalMove >= 0 ? 0.62 : 0.58;
+            const phase1Target = clampValue(startPrice + totalMove * phase1TargetRatio, low, high);
+            const phase2Target = clampValue(phase1Target - direction * pullbackDepth, low, high);
+            let prevPrice = startPrice;
+            let trendExtreme = startPrice;
+
+            for (let step = 1; step <= totalSteps; step++) {
+                const absoluteIndex = absoluteStartIndex + step;
+                const remainingSteps = totalSteps - step + 1;
+                let nextPrice;
+
+                if (step === totalSteps) {
+                    nextPrice = roundMinutePrice(endPrice);
+                } else {
+                    const allowHighTouch = absoluteIndex === highAnchorIndex;
+                    const allowLowTouch = absoluteIndex === lowAnchorIndex;
+                    let candidate;
+                    let phaseDirection = direction || Math.sign(totalMove) || 1;
+
+                    if (step <= phase1EndStep) {
+                        const localProgress = step / Math.max(phase1EndStep, 1);
+                        candidate = startPrice + (phase1Target - startPrice) * smoothStep(localProgress);
+                    } else if (step <= phase2EndStep) {
+                        const localProgress = (step - phase1EndStep) / Math.max(phase2EndStep - phase1EndStep, 1);
+                        candidate = phase1Target + (phase2Target - phase1Target) * smoothStep(localProgress);
+                        phaseDirection = -(direction || Math.sign(totalMove) || 1);
+                    } else {
+                        const localProgress = (step - phase2EndStep) / Math.max(totalSteps - phase2EndStep, 1);
+                        candidate = phase2Target + (endPrice - phase2Target) * smoothStep(localProgress);
+                    }
+
+                    nextPrice = projectFlexibleMinutePrice(
+                        prevPrice,
+                        candidate,
+                        endPrice,
+                        remainingSteps,
+                        minTickChange,
+                        maxTickChange,
+                        low,
+                        high
+                    );
+
+                    if (phaseDirection > 0 && nextPrice < prevPrice) {
+                        nextPrice = projectPriceFromPrevious(
+                            prevPrice,
+                            prevPrice * (1 + minTickChange / 100),
+                            minTickChange,
+                            maxTickChange,
+                            low,
+                            high
+                        );
+                    } else if (phaseDirection < 0 && nextPrice > prevPrice) {
+                        nextPrice = projectPriceFromPrevious(
+                            prevPrice,
+                            prevPrice * (1 - minTickChange / 100),
+                            minTickChange,
+                            maxTickChange,
+                            low,
+                            high
+                        );
+                    }
+
+                    if (phaseDirection === direction) {
+                        if (direction > 0) {
+                            const retraceFloor = trendExtreme - Math.max(pullbackDepth, Math.abs(prevPrice) * (minTickChange / 100));
+                            nextPrice = Math.max(nextPrice, retraceFloor);
+                        } else {
+                            const retraceCeiling = trendExtreme + Math.max(pullbackDepth, Math.abs(prevPrice) * (minTickChange / 100));
+                            nextPrice = Math.min(nextPrice, retraceCeiling);
+                        }
+                    }
+
+                    nextPrice = nudgeMinuteUniquePrice(nextPrice, prevPrice, Math.sign(nextPrice - prevPrice) || phaseDirection, minTickChange);
+                    nextPrice = enforceMinuteChangeFloor(prevPrice, nextPrice, Math.sign(nextPrice - prevPrice) || phaseDirection, minTickChange);
+
+                    if (!allowHighTouch && nextPrice >= high - epsilon) {
+                        nextPrice = clampValue(high - Math.max(getMinutePriceTickUnit(high, minTickChange) * 0.12, 0.0001), low, high);
+                    }
+                    if (!allowLowTouch && nextPrice <= low + epsilon) {
+                        nextPrice = clampValue(low + Math.max(getMinutePriceTickUnit(low, minTickChange) * 0.12, 0.0001), low, high);
+                    }
+                }
+
+                prices.push(roundMinutePrice(clampValue(nextPrice, low, high)));
+                prevPrice = prices[prices.length - 1];
+                trendExtreme = direction > 0 ? Math.max(trendExtreme, prevPrice) : Math.min(trendExtreme, prevPrice);
+            }
+
+            return prices;
+        }
+
+        function shouldLightTouchSmoothMinute(styleProfile) {
+            return isSmoothMinuteKernel(styleProfile)
+                && styleProfile
+                && styleProfile.kernel !== 'event_shock'
+                && styleProfile.kernel !== 'breakdown'
+                && styleProfile.kernel !== 'capitulation_bounce';
         }
 
         function projectMinuteEndpointPrice(prevPrice, candidatePrice, finalPrice, usedTicks, remainingTicks, low, high, maxTickChange) {
@@ -2156,15 +2551,23 @@
             }
 
             const span = Math.abs(totalMove);
+            const isStairKernel = styleProfile && (styleProfile.kernel === 'stair_up' || styleProfile.kernel === 'stair_down');
             const minMoveUnit = Math.max(
-                Math.abs(segment.start) * (minTickChange / 100) * 1.4,
-                span / Math.max(totalTicks, 1)
+                Math.abs(segment.start) * (minTickChange / 100) * (isStairKernel ? 0.85 : 1.4),
+                span / Math.max(isStairKernel ? totalTicks * 1.25 : totalTicks, 1)
             );
             const maxSegmentsBySpan = Math.max(1, Math.min(
                 totalTicks,
-                Math.floor(span / Math.max(minMoveUnit, epsilon))
+                Math.floor(span / Math.max(minMoveUnit, epsilon)) + (isStairKernel ? 2 : 0)
             ));
-            const effectiveBlueprint = trimMinuteBlueprint(blueprint, maxSegmentsBySpan);
+            const smoothKernel = isSmoothMinuteKernel(styleProfile);
+            const preferredMaxSegments = smoothKernel
+                ? Math.min(maxSegmentsBySpan, totalTicks >= 18 ? 4 : 3)
+                : maxSegmentsBySpan;
+            const effectiveBlueprint = normalizeMinuteBlueprintForTrend(
+                trimMinuteBlueprint(blueprint, preferredMaxSegments),
+                styleProfile
+            );
             if (!Array.isArray(effectiveBlueprint) || effectiveBlueprint.length === 0) {
                 return [{ ...segment, ticks: totalTicks }];
             }
@@ -2180,6 +2583,18 @@
             const modeledSegments = [];
             let prevPrice = segment.start;
             let remainingTicks = totalTicks;
+            let trendExtreme = segment.start;
+            let countertrendCount = 0;
+            const maxCountertrendSegments = styleProfile && (
+                styleProfile.kernel === 'mean_revert'
+                || styleProfile.kernel === 'regime_switch'
+                || styleProfile.kernel === 'volatility_cluster'
+                || styleProfile.kernel === 'wavelet'
+            ) ? 2 : 1;
+            const maxCounterRetrace = Math.max(
+                span * Math.max(Math.min((styleProfile && styleProfile.pullbackRatio ? styleProfile.pullbackRatio : 0.18) * 0.55, 0.22), 0.08),
+                Math.abs(segment.start) * (minTickChange / 100) * 1.1
+            );
 
             for (let i = 0; i < effectiveBlueprint.length; i++) {
                 const endpoint = effectiveBlueprint[i];
@@ -2189,6 +2604,7 @@
                 }
 
                 let nextPrice;
+                const isCountertrend = i !== effectiveBlueprint.length - 1 && endpoint.bias < 0;
                 if (i === effectiveBlueprint.length - 1) {
                     nextPrice = segment.end;
                 } else {
@@ -2205,6 +2621,30 @@
                         maxTickChange
                     );
 
+                    if (isCountertrend) {
+                        countertrendCount += 1;
+                        if (countertrendCount > maxCountertrendSegments) {
+                            nextPrice = projectMinuteEndpointPrice(
+                                prevPrice,
+                                baseline,
+                                segment.end,
+                                ticks,
+                                Math.max(remainingTicks - ticks, 0),
+                                low,
+                                high,
+                                maxTickChange
+                            );
+                        }
+                    }
+
+                    if (isCountertrend) {
+                        if (dir > 0) {
+                            nextPrice = Math.max(nextPrice, trendExtreme - maxCounterRetrace);
+                        } else {
+                            nextPrice = Math.min(nextPrice, trendExtreme + maxCounterRetrace);
+                        }
+                    }
+
                     if (Math.abs(nextPrice - high) < epsilon) {
                         nextPrice = clampValue(high - extremumNudge, low, high);
                     }
@@ -2220,6 +2660,12 @@
                         high,
                         minTickChange
                     );
+                }
+
+                if (dir > 0) {
+                    trendExtreme = Math.max(trendExtreme, nextPrice);
+                } else {
+                    trendExtreme = Math.min(trendExtreme, nextPrice);
                 }
 
                 modeledSegments.push({
@@ -2359,9 +2805,14 @@
         function createMinuteAnchors(aligned, open, high, low, close, styleProfile, minTickChange) {
             const lastIndex = aligned.length - 1;
             const epsilon = 0.000001;
-            const profile = styleProfile || getMinuteStyleProfile(currentStyle, close > open ? 'pureUp' : 'pureDown');
+            const profile = styleProfile || getMinuteStyleProfile(
+                currentStyle,
+                close > open ? 'minuteUp' : (close < open ? 'minuteDown' : 'flat')
+            );
             let highIndex = aligned.findIndex(detail => Math.abs(detail.price - high) < epsilon);
             let lowIndex = aligned.findIndex(detail => Math.abs(detail.price - low) < epsilon);
+            const isUpTrend = close > open + epsilon;
+            const isDownTrend = close < open - epsilon;
             const fallbackHighIndex = clampValue(Math.round(lastIndex * profile.highBias), 1, Math.max(1, lastIndex - 1));
             const fallbackLowIndex = clampValue(Math.round(lastIndex * profile.lowBias), 1, Math.max(1, lastIndex - 1));
             
@@ -2392,6 +2843,17 @@
                 } else {
                     highIndex = clampValue(Math.round(lastIndex * Math.min(profile.highBias, 0.34)), 1, Math.max(1, lastIndex - 2));
                     lowIndex = clampValue(Math.round(lastIndex * Math.max(profile.lowBias, 0.66)), highIndex + 1, Math.max(highIndex + 1, lastIndex - 1));
+                }
+            }
+
+            if (isMinuteFakeBreakEnabled()) {
+                if (isUpTrend && low < open - epsilon) {
+                    lowIndex = clampValue(Math.round(lastIndex * 0.08), 1, Math.max(1, lastIndex - 2));
+                    if (Math.abs(high - open) > epsilon && Math.abs(high - close) > epsilon) {
+                        highIndex = clampValue(Math.round(lastIndex * 0.86), lowIndex + 1, Math.max(lowIndex + 1, lastIndex - 1));
+                    }
+                } else if (isDownTrend && low < close - epsilon) {
+                    lowIndex = clampValue(Math.round(lastIndex * 0.92), 1, Math.max(1, lastIndex - 1));
                 }
             }
             
@@ -2508,6 +2970,24 @@
             if (totalSteps <= 0) {
                 return [];
             }
+
+            if (isSmoothMinuteKernel(styleProfile) && totalSteps >= 4) {
+                return buildSmoothMinuteBridge(
+                    startPrice,
+                    endPrice,
+                    totalSteps,
+                    direction,
+                    minTickChange,
+                    maxTickChange,
+                    low,
+                    high,
+                    styleProfile,
+                    absoluteStartIndex,
+                    absoluteEndIndex,
+                    highAnchorIndex,
+                    lowAnchorIndex
+                );
+            }
             
             const prices = [];
             const epsilon = 0.000001;
@@ -2602,7 +3082,7 @@
             }
 
             const tailStartPrice = clampValue(details[tailStartIndex].price, low, high);
-            const inferredTrendType = close > open ? 'pureUp' : (close < open ? 'pureDown' : 'normal');
+            const inferredTrendType = close > open ? 'minuteUp' : (close < open ? 'minuteDown' : 'flat');
             const profile = styleProfile || getMinuteStyleProfile(currentStyle, inferredTrendType);
             const bridgeDirection = getSegmentDirection(tailStartPrice, nearClosePrice, nearClosePrice >= tailStartPrice ? 1 : -1);
             const bridgeSteps = (lastIndex - 1) - tailStartIndex;
@@ -2628,6 +3108,188 @@
 
             details[lastIndex - 1].price = nearClosePrice;
             details[lastIndex].price = roundMinutePrice(close);
+            return details;
+        }
+
+        function suppressExcessMinuteReversals(details, fixedIndices, minTickChange, maxTickChange, low, high, maxReversals = 4) {
+            if (!Array.isArray(details) || details.length < 6) {
+                return details;
+            }
+
+            const getMoveSign = (left, right) => {
+                const delta = right - left;
+                return delta > 0 ? 1 : delta < 0 ? -1 : 0;
+            };
+
+            for (let pass = 0; pass < 2; pass++) {
+                let lastSign = 0;
+                let reversalCount = 0;
+
+                for (let i = 1; i < details.length; i++) {
+                    const sign = getMoveSign(details[i - 1].price, details[i].price);
+                    if (sign === 0) {
+                        continue;
+                    }
+
+                    if (lastSign !== 0 && sign !== lastSign) {
+                        reversalCount += 1;
+                    }
+
+                    if (reversalCount > maxReversals && i < details.length - 1) {
+                        const mutableIndex = fixedIndices && fixedIndices.has(i) ? i + 1 : i;
+                        if (mutableIndex <= 0 || mutableIndex >= details.length - 1 || (fixedIndices && fixedIndices.has(mutableIndex))) {
+                            lastSign = sign;
+                            continue;
+                        }
+
+                        const prevPrice = details[mutableIndex - 1].price;
+                        const nextPrice = details[mutableIndex + 1].price;
+                        const dominantSign = lastSign || Math.sign(nextPrice - prevPrice) || sign || 1;
+                        let targetPrice = prevPrice * (1 + dominantSign * minTickChange / 100);
+                        targetPrice = dominantSign > 0
+                            ? Math.min(targetPrice, nextPrice)
+                            : Math.max(targetPrice, nextPrice);
+
+                        let projected = projectPriceFromPrevious(
+                            prevPrice,
+                            targetPrice,
+                            minTickChange,
+                            maxTickChange,
+                            low,
+                            high
+                        );
+                        projected = projectPriceFromNext(
+                            projected,
+                            nextPrice,
+                            minTickChange,
+                            maxTickChange,
+                            low,
+                            high
+                        );
+
+                        details[mutableIndex].price = clampValue(projected, low, high);
+                        reversalCount = Math.max(0, reversalCount - 1);
+                    }
+
+                    lastSign = getMoveSign(details[i - 1].price, details[i].price) || lastSign;
+                }
+            }
+
+            return details;
+        }
+
+        function dedupeAdjacentMinutePrices(details, fixedIndices, open, high, low, close, minTickChange, maxTickChange) {
+            if (!Array.isArray(details) || details.length < 2) {
+                return details;
+            }
+
+            const epsilon = 0.000001;
+            const mutableFixed = fixedIndices instanceof Set ? fixedIndices : new Set();
+            const lastIndex = details.length - 1;
+            const directHighIndex = details.findIndex(detail => Math.abs(detail.price - high) < epsilon);
+            const directLowIndex = details.findIndex(detail => Math.abs(detail.price - low) < epsilon);
+            if (directHighIndex >= 0) mutableFixed.add(directHighIndex);
+            if (directLowIndex >= 0) mutableFixed.add(directLowIndex);
+            mutableFixed.add(0);
+            mutableFixed.add(lastIndex);
+
+            for (let pass = 0; pass < 3; pass++) {
+                let changed = false;
+
+                for (let i = 1; i <= lastIndex; i++) {
+                    const prevPrice = details[i - 1].price;
+                    const currentPrice = details[i].price;
+                    if (Math.abs(currentPrice - prevPrice) >= epsilon) {
+                        continue;
+                    }
+
+                    const currentFixed = mutableFixed.has(i);
+                    const prevFixed = mutableFixed.has(i - 1);
+                    const targetIndex = currentFixed && !prevFixed ? i - 1 : i;
+                    if (mutableFixed.has(targetIndex)) {
+                        continue;
+                    }
+
+                    const nextPrice = targetIndex < lastIndex ? details[targetIndex + 1].price : details[targetIndex].price;
+                    const fallbackDirection = Math.sign(nextPrice - prevPrice)
+                        || Math.sign(close - open)
+                        || (targetIndex >= lastIndex / 2 ? 1 : -1);
+
+                    let candidate = ensureUniqueMinutePrice(
+                        details[targetIndex].price,
+                        targetIndex > 0 ? details[targetIndex - 1].price : prevPrice,
+                        fallbackDirection,
+                        low,
+                        high,
+                        minTickChange
+                    );
+
+                    if (targetIndex > 0) {
+                        candidate = projectPriceFromPrevious(
+                            details[targetIndex - 1].price,
+                            candidate,
+                            minTickChange,
+                            maxTickChange,
+                            low,
+                            high
+                        );
+                    }
+                    if (targetIndex < lastIndex) {
+                        candidate = projectPriceFromNext(
+                            candidate,
+                            details[targetIndex + 1].price,
+                            minTickChange,
+                            maxTickChange,
+                            low,
+                            high
+                        );
+                    }
+
+                    if (Math.abs(candidate - details[targetIndex].price) < epsilon) {
+                        const alternateDirection = fallbackDirection >= 0 ? -1 : 1;
+                        let alternate = ensureUniqueMinutePrice(
+                            details[targetIndex].price,
+                            targetIndex > 0 ? details[targetIndex - 1].price : prevPrice,
+                            alternateDirection,
+                            low,
+                            high,
+                            minTickChange
+                        );
+                        if (targetIndex > 0) {
+                            alternate = projectPriceFromPrevious(
+                                details[targetIndex - 1].price,
+                                alternate,
+                                minTickChange,
+                                maxTickChange,
+                                low,
+                                high
+                            );
+                        }
+                        if (targetIndex < lastIndex) {
+                            alternate = projectPriceFromNext(
+                                alternate,
+                                details[targetIndex + 1].price,
+                                minTickChange,
+                                maxTickChange,
+                                low,
+                                high
+                            );
+                        }
+                        candidate = alternate;
+                    }
+
+                    if (Math.abs(candidate - details[targetIndex].price) >= epsilon) {
+                        details[targetIndex].price = roundMinutePrice(clampValue(candidate, low, high));
+                        changed = true;
+                    }
+                }
+
+                refreshMinuteDetailMetrics(details, minTickChange, maxTickChange);
+                if (!changed) {
+                    break;
+                }
+            }
+
             return details;
         }
         
@@ -2870,6 +3532,10 @@
                 return details;
             }
 
+            const inferredTrendType = close > open ? 'minuteUp' : (close < open ? 'minuteDown' : 'flat');
+            const styleProfile = getMinuteStyleProfile(currentStyle, inferredTrendType);
+            const lightTouchSmoothMinute = shouldLightTouchSmoothMinute(styleProfile);
+
             const directAligned = details.map(detail => ({
                 ...detail,
                 price: clampValue(detail.price, low, high)
@@ -2904,6 +3570,10 @@
                 maxTickChange
             );
             suppressMinuteDetailPingPong(directAligned, directFixedIndices, minTickChange, maxTickChange, low, high);
+            if (!lightTouchSmoothMinute) {
+                suppressMinuteDeepVSwings(directAligned, directFixedIndices, minTickChange, maxTickChange, low, high);
+                suppressExcessMinuteReversals(directAligned, directFixedIndices, minTickChange, maxTickChange, low, high, 4);
+            }
             applyMinutePreCloseTailAnchors(directAligned, open, high, low, close, minTickChange, maxTickChange, styleProfile);
 
             const directValidation = validateMinuteDetailSeries(directAligned, open, high, low, close, minTickChange, maxTickChange);
@@ -2913,13 +3583,12 @@
                 directValidation.uniqueHigh &&
                 directValidation.uniqueLow
             ) {
+                dedupeAdjacentMinutePrices(directAligned, directFixedIndices, open, high, low, close, minTickChange, maxTickChange);
                 return refreshMinuteDetailMetrics(directAligned, minTickChange, maxTickChange);
             }
             
             const aligned = details.map(detail => ({ ...detail }));
             const lastIndex = aligned.length - 1;
-            const inferredTrendType = close > open ? 'pureUp' : (close < open ? 'pureDown' : 'normal');
-            const styleProfile = getMinuteStyleProfile(currentStyle, inferredTrendType);
             const anchors = createMinuteAnchors(aligned, open, high, low, close, styleProfile, minTickChange);
             const fixedIndices = new Set();
             const highAnchor = anchors.find(anchor => Math.abs(anchor.price - high) < 0.000001);
@@ -2972,7 +3641,7 @@
                 aligned[anchor.index].price = anchor.price;
             }
 
-            for (let pass = 0; pass < 4; pass++) {
+            for (let pass = 0; pass < (lightTouchSmoothMinute ? 2 : 4); pass++) {
                 for (let i = 0; i <= lastIndex; i++) {
                     aligned[i].price = clampValue(aligned[i].price, low, high);
                     if (i !== highAnchorIndex && Math.abs(aligned[i].price - high) < 0.000001) {
@@ -3011,10 +3680,15 @@
                     maxTickChange
                 );
                 suppressMinuteDetailPingPong(aligned, fixedIndices, minTickChange, maxTickChange, low, high);
+                if (!lightTouchSmoothMinute) {
+                    suppressMinuteDeepVSwings(aligned, fixedIndices, minTickChange, maxTickChange, low, high);
+                    suppressExcessMinuteReversals(aligned, fixedIndices, minTickChange, maxTickChange, low, high, 4);
+                }
 
                 const passValidation = validateMinuteDetailSeries(aligned, open, high, low, close, minTickChange, maxTickChange);
                 if (passValidation.allCompliant && passValidation.candleMatched && passValidation.uniqueHigh && passValidation.uniqueLow) {
                     applyMinutePreCloseTailAnchors(aligned, open, high, low, close, minTickChange, maxTickChange, styleProfile);
+                    dedupeAdjacentMinutePrices(aligned, fixedIndices, open, high, low, close, minTickChange, maxTickChange);
                     return refreshMinuteDetailMetrics(aligned, minTickChange, maxTickChange);
                 }
             }
@@ -3076,14 +3750,20 @@
                 maxTickChange
             );
             suppressMinuteDetailPingPong(aligned, fixedIndices, minTickChange, maxTickChange, low, high);
+            if (!lightTouchSmoothMinute) {
+                suppressMinuteDeepVSwings(aligned, fixedIndices, minTickChange, maxTickChange, low, high);
+                suppressExcessMinuteReversals(aligned, fixedIndices, minTickChange, maxTickChange, low, high, 4);
+            }
 
             const fallbackValidation = validateMinuteDetailSeries(aligned, open, high, low, close, minTickChange, maxTickChange);
             if (fallbackValidation.allCompliant && fallbackValidation.candleMatched && fallbackValidation.uniqueHigh && fallbackValidation.uniqueLow) {
                 applyMinutePreCloseTailAnchors(aligned, open, high, low, close, minTickChange, maxTickChange, styleProfile);
+                dedupeAdjacentMinutePrices(aligned, fixedIndices, open, high, low, close, minTickChange, maxTickChange);
                 return refreshMinuteDetailMetrics(aligned, minTickChange, maxTickChange);
             }
             
             applyMinutePreCloseTailAnchors(aligned, open, high, low, close, minTickChange, maxTickChange, styleProfile);
+            dedupeAdjacentMinutePrices(aligned, fixedIndices, open, high, low, close, minTickChange, maxTickChange);
             return refreshMinuteDetailMetrics(aligned, minTickChange, maxTickChange);
         }
 
@@ -3094,9 +3774,10 @@
                 return result;
             }
 
-            const inferredTrendType = close > open ? 'pureUp' : (close < open ? 'pureDown' : 'normal');
+            const inferredTrendType = close > open ? 'minuteUp' : (close < open ? 'minuteDown' : 'flat');
             const profile = getMinuteStyleProfile(currentStyle, inferredTrendType);
             applyMinutePreCloseTailAnchors(result.details, open, high, low, close, minTickChange, maxTickChange, profile);
+            dedupeAdjacentMinutePrices(result.details, new Set([0, result.details.length - 1]), open, high, low, close, minTickChange, maxTickChange);
             refreshMinuteDetailMetrics(result.details, minTickChange, maxTickChange);
             const validation = validateMinuteDetailSeries(result.details, open, high, low, close, minTickChange, maxTickChange);
             result.allCompliant = Boolean(validation.allCompliant && validation.candleMatched && validation.uniqueHigh && validation.uniqueLow);
@@ -3813,28 +4494,126 @@
             };
         }
 
+        const ALL_PROFESSIONAL_MODELS = [
+            '趋势跟随模型',
+            '动量延续模型',
+            '均值回归模型',
+            '通道突破模型',
+            'GARCH波动率聚集模型',
+            '随机波动率模型',
+            '马尔可夫状态切换模型',
+            '事件冲击模型',
+            '泊松跳跃扩散模型',
+            'Copula相关模型',
+            'ARMA-GARCH模型',
+            '分数布朗运动模型',
+            '小波分解模型',
+            '扩散模型',
+            '试盘-洗盘-拉升模型',
+            '回踩确认二波突破模型',
+            '诱多出货模型',
+            '阴跌吸筹模型',
+            '破位踩踏模型',
+            '箱体震荡模型',
+            '收敛三角模型',
+            '均价缠绕模型'
+        ];
+
         const PROFESSIONAL_MODEL_CATALOG = {
-            up: [
-                { name: '马尔可夫状态切换模型', fn: generateMarkovSwitchingUpTrend },
-                { name: '分数布朗运动模型', fn: generateFractionalGBMUpTrend },
-                { name: '泊松跳跃扩散模型', fn: generatePoissonUpTrend },
-                { name: 'Copula相关模型', fn: generateCopulaUpTrend },
-                { name: '小波分解模型', fn: generateWaveletUpTrend },
-                { name: 'ARMA-GARCH模型', fn: generateARMAUpTrend },
-                { name: '扩散模型', fn: generateDiffusionUpTrend }
-            ],
-            down: [
-                { name: '事件冲击模型', fn: generateThreeStageDownTrend },
-                { name: '通道突破模型', fn: generateBreakdownDownTrend },
-                { name: '均值回归模型', fn: generateBounceDownTrend },
-                { name: 'GARCH波动率聚集模型', fn: generateExtremeDownTrend }
-            ],
-            flat: [
-                { name: '均值回归模型', fn: generateRandomFlatTrend },
-                { name: '小波分解模型', fn: generateBoxFlatTrend },
-                { name: '马尔可夫状态切换模型', fn: generateTriangleFlatTrend },
-                { name: '扩散模型', fn: generateNarrowFlatTrend }
-            ]
+            up: ALL_PROFESSIONAL_MODELS.map(name => ({ name, fn: generateMarkovSwitchingUpTrend })),
+            down: ALL_PROFESSIONAL_MODELS.map(name => ({ name, fn: generateThreeStageDownTrend })),
+            flat: ALL_PROFESSIONAL_MODELS.map(name => ({ name, fn: generateRandomFlatTrend }))
+        };
+
+        const MODEL_WAVE_TEMPLATE_MAP = {
+            '趋势跟随模型': {
+                up: { anchors: [0.00, 0.36, 0.28, 0.78, 1.00], positions: [0.00, 0.24, 0.48, 0.78, 1.00] },
+                down: { anchors: [1.00, 0.64, 0.72, 0.22, 0.00], positions: [0.00, 0.24, 0.48, 0.78, 1.00] }
+            },
+            '动量延续模型': {
+                up: { anchors: [0.00, 0.42, 0.34, 0.86, 1.00], positions: [0.00, 0.22, 0.42, 0.76, 1.00] },
+                down: { anchors: [1.00, 0.58, 0.66, 0.14, 0.00], positions: [0.00, 0.22, 0.42, 0.76, 1.00] }
+            },
+            '均值回归模型': {
+                up: { anchors: [0.00, 0.34, 0.24, 0.74, 1.00], positions: [0.00, 0.25, 0.54, 0.80, 1.00] },
+                down: { anchors: [1.00, 0.66, 0.78, 0.26, 0.00], positions: [0.00, 0.25, 0.54, 0.80, 1.00] }
+            },
+            '通道突破模型': {
+                up: { anchors: [0.00, 0.12, 0.10, 0.84, 1.00], positions: [0.00, 0.28, 0.52, 0.72, 1.00] },
+                down: { anchors: [1.00, 0.88, 0.90, 0.16, 0.00], positions: [0.00, 0.28, 0.52, 0.72, 1.00] }
+            },
+            'GARCH波动率聚集模型': {
+                up: { anchors: [0.00, 0.38, 0.26, 0.80, 1.00], positions: [0.00, 0.24, 0.50, 0.78, 1.00] },
+                down: { anchors: [1.00, 0.62, 0.74, 0.20, 0.00], positions: [0.00, 0.24, 0.50, 0.78, 1.00] }
+            },
+            '随机波动率模型': {
+                up: { anchors: [0.00, 0.35, 0.27, 0.76, 1.00], positions: [0.00, 0.23, 0.49, 0.79, 1.00] },
+                down: { anchors: [1.00, 0.65, 0.73, 0.24, 0.00], positions: [0.00, 0.23, 0.49, 0.79, 1.00] }
+            },
+            '马尔可夫状态切换模型': {
+                up: { anchors: [0.00, 0.40, 0.30, 0.82, 1.00], positions: [0.00, 0.22, 0.46, 0.74, 1.00] },
+                down: { anchors: [1.00, 0.60, 0.70, 0.18, 0.00], positions: [0.00, 0.22, 0.46, 0.74, 1.00] }
+            },
+            '事件冲击模型': {
+                up: { anchors: [0.00, 0.30, 0.22, 0.88, 1.00], positions: [0.00, 0.18, 0.44, 0.72, 1.00] },
+                down: { anchors: [1.00, 0.70, 0.78, 0.10, 0.00], positions: [0.00, 0.18, 0.44, 0.72, 1.00] }
+            },
+            '泊松跳跃扩散模型': {
+                up: { anchors: [0.00, 0.37, 0.31, 0.87, 1.00], positions: [0.00, 0.20, 0.48, 0.76, 1.00] },
+                down: { anchors: [1.00, 0.63, 0.69, 0.13, 0.00], positions: [0.00, 0.20, 0.48, 0.76, 1.00] }
+            },
+            'Copula相关模型': {
+                up: { anchors: [0.00, 0.33, 0.29, 0.75, 1.00], positions: [0.00, 0.24, 0.46, 0.77, 1.00] },
+                down: { anchors: [1.00, 0.67, 0.71, 0.25, 0.00], positions: [0.00, 0.24, 0.46, 0.77, 1.00] }
+            },
+            'ARMA-GARCH模型': {
+                up: { anchors: [0.00, 0.39, 0.28, 0.83, 1.00], positions: [0.00, 0.21, 0.47, 0.76, 1.00] },
+                down: { anchors: [1.00, 0.61, 0.72, 0.17, 0.00], positions: [0.00, 0.21, 0.47, 0.76, 1.00] }
+            },
+            '分数布朗运动模型': {
+                up: { anchors: [0.00, 0.31, 0.26, 0.72, 1.00], positions: [0.00, 0.26, 0.50, 0.82, 1.00] },
+                down: { anchors: [1.00, 0.69, 0.74, 0.28, 0.00], positions: [0.00, 0.26, 0.50, 0.82, 1.00] }
+            },
+            '小波分解模型': {
+                up: { anchors: [0.00, 0.36, 0.27, 0.78, 1.00], positions: [0.00, 0.23, 0.48, 0.80, 1.00] },
+                down: { anchors: [1.00, 0.64, 0.73, 0.22, 0.00], positions: [0.00, 0.23, 0.48, 0.80, 1.00] }
+            },
+            '扩散模型': {
+                up: { anchors: [0.00, 0.28, 0.24, 0.70, 1.00], positions: [0.00, 0.27, 0.52, 0.84, 1.00] },
+                down: { anchors: [1.00, 0.72, 0.76, 0.30, 0.00], positions: [0.00, 0.27, 0.52, 0.84, 1.00] }
+            },
+            '试盘-洗盘-拉升模型': {
+                up: { anchors: [0.00, 0.24, 0.18, 0.90, 1.00], positions: [0.00, 0.16, 0.40, 0.76, 1.00] },
+                down: { anchors: [1.00, 0.76, 0.82, 0.22, 0.00], positions: [0.00, 0.16, 0.40, 0.76, 1.00] }
+            },
+            '回踩确认二波突破模型': {
+                up: { anchors: [0.00, 0.38, 0.20, 0.88, 1.00], positions: [0.00, 0.20, 0.48, 0.78, 1.00] },
+                down: { anchors: [1.00, 0.62, 0.80, 0.12, 0.00], positions: [0.00, 0.20, 0.48, 0.78, 1.00] }
+            },
+            '诱多出货模型': {
+                up: { anchors: [0.00, 0.46, 0.32, 0.62, 1.00], positions: [0.00, 0.18, 0.42, 0.70, 1.00] },
+                down: { anchors: [1.00, 0.54, 0.72, 0.16, 0.00], positions: [0.00, 0.18, 0.42, 0.70, 1.00] }
+            },
+            '阴跌吸筹模型': {
+                up: { anchors: [0.00, 0.26, 0.22, 0.68, 1.00], positions: [0.00, 0.28, 0.52, 0.84, 1.00] },
+                down: { anchors: [1.00, 0.74, 0.79, 0.24, 0.00], positions: [0.00, 0.28, 0.52, 0.84, 1.00] }
+            },
+            '破位踩踏模型': {
+                up: { anchors: [0.00, 0.22, 0.18, 0.86, 1.00], positions: [0.00, 0.30, 0.52, 0.74, 1.00] },
+                down: { anchors: [1.00, 0.78, 0.84, 0.10, 0.00], positions: [0.00, 0.30, 0.52, 0.74, 1.00] }
+            },
+            '箱体震荡模型': {
+                up: { anchors: [0.00, 0.18, 0.16, 0.58, 1.00], positions: [0.00, 0.28, 0.55, 0.82, 1.00] },
+                down: { anchors: [1.00, 0.82, 0.84, 0.42, 0.00], positions: [0.00, 0.28, 0.55, 0.82, 1.00] }
+            },
+            '收敛三角模型': {
+                up: { anchors: [0.00, 0.20, 0.18, 0.60, 1.00], positions: [0.00, 0.30, 0.56, 0.84, 1.00] },
+                down: { anchors: [1.00, 0.80, 0.82, 0.40, 0.00], positions: [0.00, 0.30, 0.56, 0.84, 1.00] }
+            },
+            '均价缠绕模型': {
+                up: { anchors: [0.00, 0.16, 0.14, 0.56, 1.00], positions: [0.00, 0.30, 0.58, 0.84, 1.00] },
+                down: { anchors: [1.00, 0.84, 0.86, 0.44, 0.00], positions: [0.00, 0.30, 0.58, 0.84, 1.00] }
+            }
         };
 
         function getProfessionalModelsByTrend(trendKey) {
@@ -3926,6 +4705,7 @@
                 maxAmount: parseInt(document.getElementById('maxAmount').value),
                 minTickChange: parseFloat(document.getElementById('minTickChange').value),
                 maxTickChange: parseFloat(document.getElementById('maxTickChange').value),
+                allowMinuteFakeBreak: Boolean(document.getElementById('allowMinuteFakeBreak') && document.getElementById('allowMinuteFakeBreak').checked),
                 selectedModel: document.getElementById('selectedModel') ? document.getElementById('selectedModel').value : ''
             };
         }
@@ -4080,10 +4860,30 @@
 
         function buildMinuteDetailsFromAnchors(open, high, low, close, segments, totalTicks, avgAmountPerTick, styleProfile, minTickChange, maxTickChange) {
             const epsilon = 0.000001;
+            const baseSegments = Array.isArray(segments) ? segments : [];
+            const effectiveSegments = [];
+
+            for (const segment of baseSegments) {
+                const modeledSegments = createModeledMinuteSegments(
+                    segment,
+                    segment.ticks,
+                    styleProfile,
+                    low,
+                    high,
+                    minTickChange,
+                    maxTickChange
+                );
+                if (Array.isArray(modeledSegments) && modeledSegments.length > 0) {
+                    effectiveSegments.push(...modeledSegments);
+                } else {
+                    effectiveSegments.push(segment);
+                }
+            }
+
             const anchors = [{ index: 0, price: open, name: '开盘价' }];
             let cumulativeIndex = 0;
 
-            for (const segment of segments) {
+            for (const segment of effectiveSegments) {
                 cumulativeIndex += segment.ticks;
                 anchors.push({
                     index: cumulativeIndex,
@@ -4111,7 +4911,7 @@
             }];
 
             let absoluteStartIndex = 0;
-            for (const segment of segments) {
+            for (const segment of effectiveSegments) {
                 if (segment.ticks <= 0) {
                     continue;
                 }
@@ -4307,7 +5107,7 @@
             const pattern = patterns[patternIndex];
             const styleProfile = getMinuteStyleProfile(
                 currentStyle && currentStyle !== pattern.name ? `${currentStyle} ${pattern.name}` : (currentStyle || pattern.name),
-                trendType || (overallTrend === 'down' ? 'pureDown' : 'pureUp')
+                overallTrend === 'down' ? 'minuteDown' : (overallTrend === 'up' ? 'minuteUp' : 'flat')
             );
             console.log(`形态名称: ${pattern.name}, 骨架: ${pattern.skeleton}, 结构: ${pattern.structure}`);
 
@@ -5315,8 +6115,537 @@
             });
         }
 
+        function pickRandomOppositeIndices(total, count) {
+            const candidates = [];
+            for (let i = 1; i < total - 1; i++) {
+                candidates.push(i);
+            }
+            for (let i = candidates.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                const tmp = candidates[i];
+                candidates[i] = candidates[j];
+                candidates[j] = tmp;
+            }
+            return candidates.slice(0, Math.max(0, Math.min(count, candidates.length))).sort((a, b) => a - b);
+        }
+
+        function getShortDurationOppositeCount(duration) {
+            const ratio = 0.2 + Math.random() * 0.2;
+            return Math.floor(duration * ratio);
+        }
+
+        function enforceWholePeriodCloseBoundary(candles, trend, startPrice, targetPrice) {
+            if (!Array.isArray(candles) || candles.length === 0) {
+                return candles;
+            }
+
+            const nudge = Math.max(Math.max(Math.abs(targetPrice), Math.abs(startPrice)) * 0.00001, 0.01);
+            const lastIndex = candles.length - 1;
+
+            for (let i = 0; i < candles.length; i++) {
+                let [open, close, low, high] = candles[i];
+
+                if (trend === 'up') {
+                    open = Math.min(open, targetPrice);
+                    close = Math.min(close, targetPrice);
+                    low = Math.min(low, open, close);
+                    high = Math.max(high, open, close);
+                    if (high > targetPrice) {
+                        high = targetPrice;
+                    }
+                    if (i !== lastIndex && high >= targetPrice) {
+                        high = Math.max(Math.max(open, close), targetPrice - nudge);
+                    }
+                    if (low < startPrice) {
+                        low = startPrice;
+                    }
+                } else if (trend === 'down') {
+                    open = Math.max(open, targetPrice);
+                    close = Math.max(close, targetPrice);
+                    low = Math.min(low, open, close);
+                    high = Math.max(high, open, close);
+                    if (low < targetPrice) {
+                        low = targetPrice;
+                    }
+                    if (i !== lastIndex && low <= targetPrice) {
+                        low = Math.min(Math.min(open, close), targetPrice + nudge);
+                    }
+                    if (high > startPrice) {
+                        high = startPrice;
+                    }
+                }
+
+                low = Math.min(low, open, close);
+                high = Math.max(high, open, close);
+                candles[i] = [open, close, low, high];
+            }
+
+            if (trend === 'up') {
+                candles[0][0] = startPrice;
+                candles[0][2] = startPrice;
+                candles[lastIndex][1] = targetPrice;
+                candles[lastIndex][3] = Math.max(candles[lastIndex][3], targetPrice);
+                if (lastIndex > 0 && candles[lastIndex - 1][3] >= targetPrice) {
+                    candles[lastIndex - 1][3] = Math.max(Math.max(candles[lastIndex - 1][0], candles[lastIndex - 1][1]), targetPrice - nudge);
+                }
+            } else if (trend === 'down') {
+                candles[0][0] = startPrice;
+                candles[0][3] = startPrice;
+                candles[lastIndex][1] = targetPrice;
+                candles[lastIndex][2] = Math.min(candles[lastIndex][2], targetPrice);
+                if (lastIndex > 0 && candles[lastIndex - 1][2] <= targetPrice) {
+                    candles[lastIndex - 1][2] = Math.min(Math.min(candles[lastIndex - 1][0], candles[lastIndex - 1][1]), targetPrice + nudge);
+                }
+            }
+
+            for (let i = 0; i < candles.length; i++) {
+                candles[i][2] = Math.min(candles[i][2], candles[i][0], candles[i][1]);
+                candles[i][3] = Math.max(candles[i][3], candles[i][0], candles[i][1]);
+            }
+
+            return candles;
+        }
+
+        function splitDuration(duration, ratios) {
+            const total = ratios.reduce((a, b) => a + b, 0);
+            const parts = ratios.map(r => Math.max(1, Math.floor(duration * r / total)));
+            while (parts.reduce((a, b) => a + b, 0) > duration) {
+                const idx = parts.indexOf(Math.max(...parts));
+                if (parts[idx] > 1) parts[idx] -= 1;
+                else break;
+            }
+            while (parts.reduce((a, b) => a + b, 0) < duration) {
+                const idx = parts.indexOf(Math.min(...parts));
+                parts[idx] += 1;
+            }
+            return parts;
+        }
+
+        function clampCloseWithinBounds(close, floor, ceil) {
+            return clampValue(close, floor, ceil);
+        }
+
+        function samplePct(minPct, maxPct, bias = 0.5) {
+            const min = Math.max(0, Number(minPct) || 0);
+            const max = Math.max(min, Number(maxPct) || min);
+            const u = Math.random();
+            const t = u < bias
+                ? (u / Math.max(bias, 0.000001))
+                : (1 - (u - bias) / Math.max(1 - bias, 0.000001));
+            return min + (max - min) * Math.max(0, Math.min(1, t));
+        }
+
+        function sampleRange(minValue, maxValue) {
+            const min = Number(minValue) || 0;
+            const max = Number(maxValue) || min;
+            return min + Math.random() * (max - min);
+        }
+
+        function smoothStep(t) {
+            const x = Math.max(0, Math.min(1, t));
+            return x * x * (3 - 2 * x);
+        }
+
+        function createWaveIndices(duration) {
+            const lastIndex = duration - 1;
+            if (lastIndex <= 3) {
+                return [0, Math.max(1, Math.floor(lastIndex / 2)), lastIndex];
+            }
+
+            const firstRiseIndex = clampValue(Math.round(lastIndex * sampleRange(0.24, 0.34)), 1, Math.max(1, lastIndex - 3));
+            const pullbackIndex = clampValue(Math.round(lastIndex * sampleRange(0.42, 0.54)), firstRiseIndex + 1, Math.max(firstRiseIndex + 1, lastIndex - 2));
+            const secondRiseIndex = clampValue(Math.round(lastIndex * sampleRange(0.68, 0.84)), pullbackIndex + 1, Math.max(pullbackIndex + 1, lastIndex - 1));
+
+            return [0, firstRiseIndex, pullbackIndex, secondRiseIndex, lastIndex];
+        }
+
+        function createWaveIndicesFromTemplate(duration, positions) {
+            const lastIndex = duration - 1;
+            if (!Array.isArray(positions) || positions.length < 3) {
+                return createWaveIndices(duration);
+            }
+
+            const indices = positions.map((ratio, index) => {
+                if (index === 0) return 0;
+                if (index === positions.length - 1) return lastIndex;
+                return clampValue(Math.round(lastIndex * ratio), 1, Math.max(1, lastIndex - 1));
+            });
+
+            for (let i = 1; i < indices.length; i++) {
+                indices[i] = Math.max(indices[i], indices[i - 1] + (i === indices.length - 1 ? 0 : 1));
+            }
+            indices[indices.length - 1] = lastIndex;
+            return indices;
+        }
+
+        function getDirectionalWaveTemplate(modelName, trendKey) {
+            const config = MODEL_WAVE_TEMPLATE_MAP[modelName];
+            if (config && config[trendKey]) {
+                return config[trendKey];
+            }
+            return trendKey === 'up'
+                ? { anchors: [0.00, 0.36, 0.28, 0.78, 1.00], positions: [0.00, 0.24, 0.48, 0.78, 1.00] }
+                : { anchors: [1.00, 0.64, 0.72, 0.22, 0.00], positions: [0.00, 0.24, 0.48, 0.78, 1.00] };
+        }
+
+        function buildWaveClosesFromAnchors(trendKey, anchorIndices, anchorPrices, duration, targetPrice, minChange, maxChange) {
+            const closes = new Array(duration).fill(anchorPrices[0]);
+            closes[0] = anchorPrices[0];
+
+            for (let a = 0; a < anchorIndices.length - 1; a++) {
+                const startIndex = anchorIndices[a];
+                const endIndex = anchorIndices[a + 1];
+                const startPrice = anchorPrices[a];
+                const endPrice = anchorPrices[a + 1];
+                const span = endIndex - startIndex;
+
+                closes[startIndex] = startPrice;
+                if (span <= 0) {
+                    continue;
+                }
+
+                const swing = Math.abs(endPrice - startPrice);
+                const amplitudeBase = Math.max(swing * sampleRange(0.03, 0.08), Math.abs(startPrice) * 0.0004);
+
+                for (let step = 1; step < span; step++) {
+                    const idx = startIndex + step;
+                    const t = step / span;
+                    const eased = smoothStep(t);
+                    const base = startPrice + (endPrice - startPrice) * eased;
+                    const waveDirection = (trendKey === 'up')
+                        ? (endPrice >= startPrice ? 1 : -1)
+                        : (endPrice <= startPrice ? -1 : 1);
+                    const localWave = Math.sin(t * Math.PI) * amplitudeBase * sampleRange(0.25, 0.85) * waveDirection;
+                    const candidate = Math.round(base + localWave);
+                    const rem = (duration - 1) - idx;
+                    closes[idx] = projectCloseReachable(trendKey, candidate, targetPrice, rem, minChange, maxChange);
+                }
+
+                closes[endIndex] = endPrice;
+            }
+
+            closes[duration - 1] = targetPrice;
+            return closes;
+        }
+
+        function projectCloseReachable(trendKey, closeCandidate, targetPrice, rem, minChange, maxChange) {
+            if (!Number.isFinite(closeCandidate) || !Number.isFinite(targetPrice) || rem <= 0) {
+                return closeCandidate;
+            }
+
+            const minPct = Math.max(0, Number(minChange) || 0);
+            const maxPct = Math.max(minPct, Number(maxChange) || minPct);
+
+            if (trendKey === 'up') {
+                const maxFactor = 1 + maxPct / 100;
+                const minFactor = 1 + minPct / 100;
+                const reachableMin = targetPrice / Math.pow(maxFactor, rem);
+                const reachableMax = targetPrice / Math.pow(minFactor, rem);
+                return clampValue(closeCandidate, Math.min(reachableMin, reachableMax), Math.max(reachableMin, reachableMax));
+            }
+
+            if (trendKey === 'down') {
+                const maxDownFactor = Math.max(1 - maxPct / 100, 0.000001);
+                const minDownFactor = Math.max(1 - minPct / 100, 0.000001);
+                const reachableMax = targetPrice / Math.pow(maxDownFactor, rem);
+                const reachableMin = targetPrice / Math.pow(minDownFactor, rem);
+                return clampValue(closeCandidate, Math.min(reachableMin, reachableMax), Math.max(reachableMin, reachableMax));
+            }
+
+            return closeCandidate;
+        }
+
+        function enforceRunLimit(dirSeries, maxRun) {
+            const sign = x => (x > 0 ? 1 : x < 0 ? -1 : 0);
+            let run = 1;
+            for (let i = 1; i < dirSeries.length; i++) {
+                if (sign(dirSeries[i]) === sign(dirSeries[i - 1]) && sign(dirSeries[i]) !== 0) run++;
+                else run = 1;
+                if (run > maxRun) {
+                    dirSeries[i] = -dirSeries[i];
+                    run = 1;
+                }
+            }
+            return dirSeries;
+        }
+
+        function buildUpVisualClosePlan(startPrice, targetPrice, duration, minChange, maxChange, modelName = '') {
+            const closes = new Array(duration).fill(startPrice);
+            closes[0] = startPrice;
+            closes[duration - 1] = targetPrice;
+            if (duration <= 2) {
+                return closes;
+            }
+
+            const totalMove = Math.max(targetPrice - startPrice, 1);
+            const template = getDirectionalWaveTemplate(modelName, 'up');
+            const anchorIndices = createWaveIndicesFromTemplate(duration, template.positions);
+            const anchorRatios = template.anchors;
+            const firstHigh = Math.round(startPrice + totalMove * anchorRatios[1]);
+            const pullbackLow = Math.round(startPrice + totalMove * anchorRatios[2]);
+            const secondHigh = Math.round(startPrice + totalMove * anchorRatios[3]);
+            const anchorPrices = [
+                startPrice,
+                clampValue(firstHigh, startPrice, targetPrice - 1),
+                clampValue(Math.min(pullbackLow, firstHigh - Math.max(totalMove * 0.06, 1)), startPrice + Math.max(totalMove * 0.12, 1), targetPrice - 2),
+                clampValue(Math.max(secondHigh, firstHigh + Math.max(totalMove * 0.08, 1)), startPrice, targetPrice - 1),
+                targetPrice
+            ];
+
+            const waved = buildWaveClosesFromAnchors('up', anchorIndices, anchorPrices, duration, targetPrice, minChange, maxChange);
+            const maxCeil = targetPrice;
+            const minFloor = startPrice;
+            for (let i = 1; i < duration - 1; i++) {
+                closes[i] = clampCloseWithinBounds(waved[i], minFloor, maxCeil);
+            }
+            closes[duration - 1] = targetPrice;
+            return closes;
+        }
+
+        function buildDownVisualClosePlan(startPrice, targetPrice, duration, minChange, maxChange, modelName = '') {
+            const closes = new Array(duration).fill(startPrice);
+            closes[0] = startPrice;
+            closes[duration - 1] = targetPrice;
+            if (duration <= 2) {
+                return closes;
+            }
+
+            const totalMove = Math.max(startPrice - targetPrice, 1);
+            const template = getDirectionalWaveTemplate(modelName, 'down');
+            const anchorIndices = createWaveIndicesFromTemplate(duration, template.positions);
+            const anchorRatios = template.anchors;
+            const firstLow = Math.round(startPrice - totalMove * (1 - anchorRatios[1]));
+            const reboundHigh = Math.round(startPrice - totalMove * (1 - anchorRatios[2]));
+            const secondLow = Math.round(startPrice - totalMove * (1 - anchorRatios[3]));
+            const anchorPrices = [
+                startPrice,
+                clampValue(firstLow, targetPrice + 1, startPrice),
+                clampValue(Math.max(reboundHigh, firstLow + Math.max(totalMove * 0.06, 1)), targetPrice + 2, startPrice - Math.max(totalMove * 0.12, 1)),
+                clampValue(Math.min(secondLow, firstLow - Math.max(totalMove * 0.08, 1)), targetPrice + 1, startPrice),
+                targetPrice
+            ];
+
+            const waved = buildWaveClosesFromAnchors('down', anchorIndices, anchorPrices, duration, targetPrice, minChange, maxChange);
+            const maxCeil = startPrice;
+            const minFloor = targetPrice;
+            for (let i = 1; i < duration - 1; i++) {
+                closes[i] = clampCloseWithinBounds(waved[i], minFloor, maxCeil);
+            }
+            closes[duration - 1] = targetPrice;
+            return closes;
+        }
+
+        function applyModelSignatureToCloses(trendKey, closes, modelName, minChange, maxChange) {
+            if (!Array.isArray(closes) || closes.length < 6) {
+                return closes;
+            }
+
+            const name = String(modelName || '');
+            const last = closes.length - 1;
+            const adjusted = closes.slice();
+
+            const boost = (i, pct) => {
+                if (i <= 0 || i >= last) return;
+                const base = adjusted[i - 1];
+                adjusted[i] = Math.round(base * (1 + pct / 100));
+            };
+
+            const drop = (i, pct) => {
+                if (i <= 0 || i >= last) return;
+                const base = adjusted[i - 1];
+                adjusted[i] = Math.round(base * (1 - pct / 100));
+            };
+
+            const mild = samplePct(minChange, maxChange, 0.62);
+            const strong = samplePct(minChange, maxChange, 0.86);
+
+            if (trendKey === 'up') {
+                if (name.includes('泊松') || name.includes('跳跃')) {
+                    boost(Math.max(2, Math.floor(last * 0.72)), strong);
+                }
+                if (name.includes('GARCH') || name.includes('ARMA-GARCH')) {
+                    boost(Math.max(2, Math.floor(last * 0.82)), strong);
+                    drop(Math.max(2, Math.floor(last * 0.86)), mild);
+                }
+                if (name.includes('小波') || name.includes('扩散')) {
+                    drop(Math.max(2, Math.floor(last * 0.48)), mild);
+                    boost(Math.max(2, Math.floor(last * 0.58)), mild);
+                }
+                if (name.includes('Copula')) {
+                    drop(Math.max(2, Math.floor(last * 0.42)), mild);
+                    boost(Math.max(2, Math.floor(last * 0.62)), mild);
+                }
+            } else if (trendKey === 'down') {
+                if (name.includes('事件冲击')) {
+                    drop(Math.max(2, Math.floor(last * 0.56)), strong);
+                }
+                if (name.includes('通道突破') || name.includes('破位')) {
+                    drop(Math.max(2, Math.floor(last * 0.62)), strong);
+                }
+                if (name.includes('GARCH')) {
+                    drop(Math.max(2, Math.floor(last * 0.74)), strong);
+                    boost(Math.max(2, Math.floor(last * 0.78)), mild);
+                }
+                if (name.includes('均值回归')) {
+                    boost(Math.max(2, Math.floor(last * 0.68)), mild);
+                    drop(Math.max(2, Math.floor(last * 0.78)), mild);
+                }
+            }
+
+            adjusted[last] = closes[last];
+            return adjusted;
+        }
+
+        function enforceVisualCadenceByCloses(trendKey, closes) {
+            if (!Array.isArray(closes) || closes.length < 6) return closes;
+            const last = closes.length - 1;
+            const adjusted = closes.slice();
+            const diffs = [];
+            for (let i = 1; i < adjusted.length; i++) diffs.push(adjusted[i] - adjusted[i - 1]);
+
+            enforceRunLimit(diffs, trendKey === 'up' ? 6 : 6);
+
+            for (let i = 1; i < last; i++) {
+                const dir = diffs[i - 1];
+                if (dir === 0) continue;
+                const base = adjusted[i - 1];
+                adjusted[i] = base + dir;
+            }
+            adjusted[last] = closes[last];
+            return adjusted;
+        }
+
+        function applyAdaptiveTailBridge(trendKey, closes, startPrice, targetPrice, minChange, maxChange) {
+            if (!Array.isArray(closes) || closes.length < 4) {
+                return closes;
+            }
+
+            const duration = closes.length;
+            const lastIndex = duration - 1;
+            const prevIndex = lastIndex - 1;
+            const out = closes.slice();
+
+            out[0] = startPrice;
+            out[lastIndex] = targetPrice;
+
+            const prevClose = out[prevIndex];
+            const gap = Math.abs(targetPrice - prevClose);
+            const maxPct = Math.max(Math.max(0, Number(maxChange) || 0), 0.000001);
+            const maxStepAbs = Math.max(Math.abs(prevClose) * (maxPct / 100), 0.01);
+
+            const kRaw = Math.ceil(gap / maxStepAbs);
+            const k = Math.max(2, Math.min(4, kRaw));
+            const startBridge = Math.max(1, lastIndex - k);
+
+            for (let i = startBridge; i < lastIndex; i++) {
+                const open = i === 0 ? startPrice : out[i - 1];
+                const rem = lastIndex - i;
+                const ideal = open + (targetPrice - open) / Math.max(rem + 1, 1);
+                const projected = projectCloseReachable(trendKey, ideal, targetPrice, rem, minChange, maxChange);
+                out[i] = projected;
+            }
+
+            out[lastIndex] = targetPrice;
+            return out;
+        }
+
+        function rebuildCandlesFromClosePlan(trendKey, closes, minWickChange, maxWickChange, minChange, maxChange) {
+            if (!Array.isArray(closes) || closes.length < 2) {
+                return [];
+            }
+            const candles = [];
+            for (let i = 0; i < closes.length; i++) {
+                const open = i === 0 ? closes[0] : closes[i - 1];
+                const close = closes[i];
+                const candle = buildCandle(open, close, minWickChange, maxWickChange, minChange, maxChange);
+                candles.push(candle);
+            }
+            return candles;
+        }
+
+        function finalizeStrategyVisualCadence(trendKey, candles, startPrice, targetPrice, minChange, maxChange, minWickChange, maxWickChange) {
+            if (!Array.isArray(candles) || candles.length < 6) {
+                return candles;
+            }
+
+            const duration = candles.length;
+            const lowerBound = Math.min(startPrice, targetPrice);
+            const upperBound = Math.max(startPrice, targetPrice);
+            let closes = candles.map(c => c[1]);
+            closes[0] = startPrice;
+            closes[duration - 1] = targetPrice;
+
+            closes = enforceVisualCadenceByCloses(trendKey, closes);
+            closes = applyAdaptiveTailBridge(trendKey, closes, startPrice, targetPrice, minChange, maxChange);
+
+            for (let i = 1; i < duration - 1; i++) {
+                closes[i] = clampValue(closes[i], lowerBound, upperBound);
+            }
+            closes[duration - 1] = targetPrice;
+
+            let rebuilt = rebuildCandlesFromClosePlan(trendKey, closes, minWickChange, maxWickChange, minChange, maxChange);
+            rebuilt = enforceTrendExtremaBounds(rebuilt, startPrice, targetPrice, trendKey);
+            rebuilt = enforceSingleCandleBodyRange(rebuilt, minChange, maxChange, minWickChange, maxWickChange, trendKey, startPrice, targetPrice);
+            rebuilt = enforceUniquePeriodExtrema(rebuilt, trendKey, startPrice, targetPrice);
+            rebuilt = enforceWholePeriodCloseBoundary(rebuilt, trendKey, startPrice, targetPrice);
+
+            let finalCloses = rebuilt.map(c => c[1]);
+            finalCloses[0] = startPrice;
+            finalCloses[duration - 1] = targetPrice;
+            finalCloses = applyAdaptiveTailBridge(trendKey, finalCloses, startPrice, targetPrice, minChange, maxChange);
+            rebuilt = rebuildCandlesFromClosePlan(trendKey, finalCloses, minWickChange, maxWickChange, minChange, maxChange);
+            rebuilt = enforceTrendExtremaBounds(rebuilt, startPrice, targetPrice, trendKey);
+            rebuilt = enforceSingleCandleBodyRange(rebuilt, minChange, maxChange, minWickChange, maxWickChange, trendKey, startPrice, targetPrice);
+            rebuilt = enforceUniquePeriodExtrema(rebuilt, trendKey, startPrice, targetPrice);
+            rebuilt = enforceWholePeriodCloseBoundary(rebuilt, trendKey, startPrice, targetPrice);
+            return rebuilt;
+        }
+
+        function generateShortDurationSeries(trend, startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange, oppositeCount) {
+            const indices = pickRandomOppositeIndices(duration, oppositeCount);
+            const oppositeSet = new Set(indices);
+            const candles = [];
+            const targetCeiling = targetPrice;
+            const targetFloor = targetPrice;
+            const epsilon = 0.000001;
+            let prevClose = startPrice;
+
+            for (let i = 0; i < duration; i++) {
+                const open = i === 0 ? startPrice : prevClose;
+                const isLast = i === duration - 1;
+                let close;
+
+                if (isLast) {
+                    close = targetPrice;
+                } else {
+                    const isOpposite = oppositeSet.has(i);
+                    const desiredDir = trend === 'up' ? (isOpposite ? -1 : 1) : (isOpposite ? 1 : -1);
+                    const pct = minChange + Math.random() * Math.max(0, maxChange - minChange);
+                    close = open * (1 + desiredDir * pct / 100);
+
+                    if (trend === 'up' && close >= targetCeiling - epsilon) {
+                        close = targetCeiling - Math.max(open * 0.00001, 0.01);
+                    }
+                    if (trend === 'down' && close <= targetFloor + epsilon) {
+                        close = targetFloor + Math.max(open * 0.00001, 0.01);
+                    }
+                }
+
+                const candle = buildCandle(open, close, minWickChange, maxWickChange, minChange, maxChange);
+                candles.push(candle);
+                prevClose = candle[1];
+            }
+
+            candles[duration - 1][1] = targetPrice;
+            candles[duration - 1][2] = Math.min(candles[duration - 1][2], candles[duration - 1][0], candles[duration - 1][1]);
+            candles[duration - 1][3] = Math.max(candles[duration - 1][3], candles[duration - 1][0], candles[duration - 1][1]);
+
+            return enforceWholePeriodCloseBoundary(candles, trend, startPrice, targetPrice);
+        }
+
         // 生成下跌趋势
         function generateDownTrend() {
+            syncMinuteCurveOptionsFromForm();
             populateModelOptionsForTrend('down');
             const startPrice = parseFloat(document.getElementById('startPrice').value);
             const targetPctInput = Math.abs(parseFloat(document.getElementById('targetPct').value) || 0);
@@ -5350,19 +6679,33 @@
                     break;
                 }
                 currentStyle = selected.name;
-                
-                ownCandle = selected.fn(startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
-                ownCandle = fixDownCandleData(ownCandle, startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
+
+                if (trendType !== 'pureDown' && duration < 5) {
+                    const oppositeCount = getShortDurationOppositeCount(duration);
+                    ownCandle = generateShortDurationSeries('down', startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange, oppositeCount);
+                } else {
+                    ownCandle = selected.fn(startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
+                    ownCandle = fixDownCandleData(ownCandle, startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
+                }
                 
                 // 如果是纯跌模式，确保所有K线都是下跌
                 if (trendType === 'pureDown') {
                     ownCandle = makeAllCandlesDown(ownCandle);
+                }
+
+                if (trendType !== 'pureDown' && duration >= 5) {
+                    let closePlan = buildDownVisualClosePlan(startPrice, targetPrice, duration, minChange, maxChange, currentStyle);
+                    closePlan = applyModelSignatureToCloses('down', closePlan, currentStyle, minChange, maxChange);
+                    closePlan = enforceVisualCadenceByCloses('down', closePlan);
+                    ownCandle = rebuildCandlesFromClosePlan('down', closePlan, minWickChange, maxWickChange, minChange, maxChange);
                 }
                 
                 // 校验两条K线之间的涨跌幅
                 ownCandle = enforceTrendExtremaBounds(ownCandle, startPrice, targetPrice, 'down');
                 ownCandle = enforceSingleCandleBodyRange(ownCandle, minChange, maxChange, minWickChange, maxWickChange, 'down', startPrice, targetPrice);
                 ownCandle = enforceUniquePeriodExtrema(ownCandle, 'down', startPrice, targetPrice);
+                ownCandle = enforceWholePeriodCloseBoundary(ownCandle, 'down', startPrice, targetPrice);
+                ownCandle = finalizeStrategyVisualCadence('down', ownCandle, startPrice, targetPrice, minChange, maxChange, minWickChange, maxWickChange);
                 validData = validateKLineChanges(ownCandle, minKChange, maxKChange);
                 attempts++;
             }
@@ -5374,6 +6717,8 @@
             ownCandle = enforceTrendExtremaBounds(ownCandle, startPrice, targetPrice, 'down');
             ownCandle = enforceSingleCandleBodyRange(ownCandle, minChange, maxChange, minWickChange, maxWickChange, 'down', startPrice, targetPrice);
             ownCandle = enforceUniquePeriodExtrema(ownCandle, 'down', startPrice, targetPrice);
+            ownCandle = enforceWholePeriodCloseBoundary(ownCandle, 'down', startPrice, targetPrice);
+            ownCandle = finalizeStrategyVisualCadence('down', ownCandle, startPrice, targetPrice, minChange, maxChange, minWickChange, maxWickChange);
             
             currentData = {
                 ownCandle,
@@ -5393,6 +6738,7 @@
 
         // 生成上涨趋势
         function generateUpTrend() {
+            syncMinuteCurveOptionsFromForm();
             populateModelOptionsForTrend('up');
             const startPrice = parseFloat(document.getElementById('startPrice').value);
             const targetPctInput = Math.abs(parseFloat(document.getElementById('targetPct').value) || 0);
@@ -5426,19 +6772,33 @@
                     break;
                 }
                 currentStyle = selected.name;
-                
-                ownCandle = selected.fn(startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
-                ownCandle = fixUpCandleData(ownCandle, startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
+
+                if (trendType !== 'pureUp' && duration < 5) {
+                    const oppositeCount = getShortDurationOppositeCount(duration);
+                    ownCandle = generateShortDurationSeries('up', startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange, oppositeCount);
+                } else {
+                    ownCandle = selected.fn(startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
+                    ownCandle = fixUpCandleData(ownCandle, startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
+                }
                 
                 // 如果是纯涨模式，确保所有K线都是上涨
                 if (trendType === 'pureUp') {
                     ownCandle = makeAllCandlesUp(ownCandle);
+                }
+
+                if (trendType !== 'pureUp' && duration >= 5) {
+                    let closePlan = buildUpVisualClosePlan(startPrice, targetPrice, duration, minChange, maxChange, currentStyle);
+                    closePlan = applyModelSignatureToCloses('up', closePlan, currentStyle, minChange, maxChange);
+                    closePlan = enforceVisualCadenceByCloses('up', closePlan);
+                    ownCandle = rebuildCandlesFromClosePlan('up', closePlan, minWickChange, maxWickChange, minChange, maxChange);
                 }
                 
                 // 校验两条K线之间的涨跌幅
                 ownCandle = enforceTrendExtremaBounds(ownCandle, startPrice, targetPrice, 'up');
                 ownCandle = enforceSingleCandleBodyRange(ownCandle, minChange, maxChange, minWickChange, maxWickChange, 'up', startPrice, targetPrice);
                 ownCandle = enforceUniquePeriodExtrema(ownCandle, 'up', startPrice, targetPrice);
+                ownCandle = enforceWholePeriodCloseBoundary(ownCandle, 'up', startPrice, targetPrice);
+                ownCandle = finalizeStrategyVisualCadence('up', ownCandle, startPrice, targetPrice, minChange, maxChange, minWickChange, maxWickChange);
                 validData = validateKLineChanges(ownCandle, minKChange, maxKChange);
                 attempts++;
             }
@@ -5450,6 +6810,8 @@
             ownCandle = enforceTrendExtremaBounds(ownCandle, startPrice, targetPrice, 'up');
             ownCandle = enforceSingleCandleBodyRange(ownCandle, minChange, maxChange, minWickChange, maxWickChange, 'up', startPrice, targetPrice);
             ownCandle = enforceUniquePeriodExtrema(ownCandle, 'up', startPrice, targetPrice);
+            ownCandle = enforceWholePeriodCloseBoundary(ownCandle, 'up', startPrice, targetPrice);
+            ownCandle = finalizeStrategyVisualCadence('up', ownCandle, startPrice, targetPrice, minChange, maxChange, minWickChange, maxWickChange);
             
             currentData = {
                 ownCandle,
@@ -5469,6 +6831,7 @@
 
         // 生成横盘趋势
         function generateFlatTrend() {
+            syncMinuteCurveOptionsFromForm();
             populateModelOptionsForTrend('flat');
             const startPrice = parseFloat(document.getElementById('startPrice').value);
             const duration = parseInt(document.getElementById('duration').value);
@@ -6009,6 +7372,7 @@
                 return;
             }
 
+            syncMinuteCurveOptionsFromForm();
             const config = assertConfigRules(readFormConfig(), '保存规则');
             if (!config) {
                 return;
@@ -6024,6 +7388,7 @@
         
         // 预览效果
         function previewConfig() {
+            syncMinuteCurveOptionsFromForm();
             const formConfig = assertConfigRules(readFormConfig(), '预览规则');
             if (!formConfig) {
                 return;
@@ -6058,14 +7423,32 @@
                 selected = pickProfessionalModel('up');
                 ownCandle = selected.fn(startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
                 ownCandle = fixUpCandleData(ownCandle, startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
+                if (duration >= 5) {
+                    let closePlan = buildUpVisualClosePlan(startPrice, targetPrice, duration, minChange, maxChange, selected.name);
+                    closePlan = applyModelSignatureToCloses('up', closePlan, selected.name, minChange, maxChange);
+                    closePlan = enforceVisualCadenceByCloses('up', closePlan);
+                    ownCandle = rebuildCandlesFromClosePlan('up', closePlan, minWickChange, maxWickChange, minChange, maxChange);
+                }
                 ownCandle = enforceTrendExtremaBounds(ownCandle, startPrice, targetPrice, 'up');
+                ownCandle = enforceSingleCandleBodyRange(ownCandle, minChange, maxChange, minWickChange, maxWickChange, 'up', startPrice, targetPrice);
                 ownCandle = enforceUniquePeriodExtrema(ownCandle, 'up', startPrice, targetPrice);
+                ownCandle = enforceWholePeriodCloseBoundary(ownCandle, 'up', startPrice, targetPrice);
+                ownCandle = finalizeStrategyVisualCadence('up', ownCandle, startPrice, targetPrice, minChange, maxChange, minWickChange, maxWickChange);
             } else if (trendKey === 'down') {
                 selected = pickProfessionalModel('down');
                 ownCandle = selected.fn(startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
                 ownCandle = fixDownCandleData(ownCandle, startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
+                if (duration >= 5) {
+                    let closePlan = buildDownVisualClosePlan(startPrice, targetPrice, duration, minChange, maxChange, selected.name);
+                    closePlan = applyModelSignatureToCloses('down', closePlan, selected.name, minChange, maxChange);
+                    closePlan = enforceVisualCadenceByCloses('down', closePlan);
+                    ownCandle = rebuildCandlesFromClosePlan('down', closePlan, minWickChange, maxWickChange, minChange, maxChange);
+                }
                 ownCandle = enforceTrendExtremaBounds(ownCandle, startPrice, targetPrice, 'down');
+                ownCandle = enforceSingleCandleBodyRange(ownCandle, minChange, maxChange, minWickChange, maxWickChange, 'down', startPrice, targetPrice);
                 ownCandle = enforceUniquePeriodExtrema(ownCandle, 'down', startPrice, targetPrice);
+                ownCandle = enforceWholePeriodCloseBoundary(ownCandle, 'down', startPrice, targetPrice);
+                ownCandle = finalizeStrategyVisualCadence('down', ownCandle, startPrice, targetPrice, minChange, maxChange, minWickChange, maxWickChange);
             } else {
                 selected = pickProfessionalModel('flat');
                 ownCandle = selected.fn(startPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
@@ -6100,6 +7483,10 @@
             }
 
             const inputType = (input.type || '').toLowerCase();
+            if (inputType === 'checkbox') {
+                input.checked = Boolean(value);
+                return;
+            }
             if (inputType === 'number') {
                 const numericValue = Number(value);
                 if (!Number.isFinite(numericValue)) {
@@ -6287,8 +7674,10 @@
                         restoreInputValue('maxAmount', config.maxAmount);
                         restoreInputValue('minTickChange', config.minTickChange);
                         restoreInputValue('maxTickChange', config.maxTickChange);
+                        restoreInputValue('allowMinuteFakeBreak', config.allowMinuteFakeBreak);
                         syncModelSelectorByCurrentInput(config.selectedModel);
                         restoreInputValue('selectedModel', config.selectedModel);
+                        syncMinuteCurveOptionsFromForm();
                     } catch (e) {
                         console.error('加载配置失败:', e);
                     }
@@ -6298,13 +7687,124 @@
             }
         }
         
-        // 初始化加载配置
-        loadConfig();
-        initializeDerivedDefaultBindings();
-        initializeModelSelectorBindings();
-        
-        // 初始生成一个上涨趋势
-        generateUpTrend();
+        if (typeof window !== 'undefined') {
+            window.__kline_generateSeriesForTest = function(config) {
+                const startPrice = Number(config.startPrice);
+                const targetPct = Number(config.targetPct);
+                const duration = Number(config.duration);
+                const minChange = Number(config.minChange);
+                const maxChange = Number(config.maxChange);
+                const minWickChange = Number(config.minWickChange);
+                const maxWickChange = Number(config.maxWickChange);
+                const minKChange = Number(config.minKChange);
+                const maxKChange = Number(config.maxKChange);
+                const trendKey = targetPct > 0 ? 'up' : targetPct < 0 ? 'down' : 'flat';
+                const targetPrice = Math.round(startPrice * (1 + targetPct / 100));
+
+                const selected = config.modelName
+                    ? (getProfessionalModelsByTrend(trendKey).find(item => item.name === config.modelName) || pickProfessionalModel(trendKey))
+                    : pickProfessionalModel(trendKey);
+
+                if (!selected) {
+                    return { candles: [], trendKey, modelName: '' };
+                }
+
+                let ownCandle = [];
+                if (trendKey === 'up') {
+                    ownCandle = selected.fn(startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
+                    ownCandle = fixUpCandleData(ownCandle, startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
+                } else if (trendKey === 'down') {
+                    ownCandle = selected.fn(startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
+                    ownCandle = fixDownCandleData(ownCandle, startPrice, targetPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
+                } else {
+                    ownCandle = selected.fn(startPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
+                    ownCandle = fixFlatCandleData(ownCandle, startPrice, duration, minChange, maxChange, minWickChange, maxWickChange);
+                }
+
+                if (trendKey === 'up' && duration >= 5) {
+                    let closePlan = buildUpVisualClosePlan(startPrice, targetPrice, duration, minChange, maxChange, selected.name);
+                    closePlan = applyModelSignatureToCloses('up', closePlan, selected.name, minChange, maxChange);
+                    closePlan = enforceVisualCadenceByCloses('up', closePlan);
+                    ownCandle = rebuildCandlesFromClosePlan('up', closePlan, minWickChange, maxWickChange, minChange, maxChange);
+                } else if (trendKey === 'down' && duration >= 5) {
+                    let closePlan = buildDownVisualClosePlan(startPrice, targetPrice, duration, minChange, maxChange, selected.name);
+                    closePlan = applyModelSignatureToCloses('down', closePlan, selected.name, minChange, maxChange);
+                    closePlan = enforceVisualCadenceByCloses('down', closePlan);
+                    ownCandle = rebuildCandlesFromClosePlan('down', closePlan, minWickChange, maxWickChange, minChange, maxChange);
+                }
+
+                ownCandle = enforceTrendExtremaBounds(ownCandle, startPrice, targetPrice, trendKey);
+                ownCandle = enforceSingleCandleBodyRange(ownCandle, minChange, maxChange, minWickChange, maxWickChange, trendKey, startPrice, targetPrice);
+                ownCandle = enforceUniquePeriodExtrema(ownCandle, trendKey, startPrice, targetPrice);
+                ownCandle = enforceWholePeriodCloseBoundary(ownCandle, trendKey, startPrice, targetPrice);
+                if (trendKey === 'up' || trendKey === 'down') {
+                    ownCandle = finalizeStrategyVisualCadence(trendKey, ownCandle, startPrice, targetPrice, minChange, maxChange, minWickChange, maxWickChange);
+                }
+
+                if (trendKey !== 'flat') {
+                    const ok = validateKLineChanges(ownCandle, minKChange, maxKChange);
+                    if (!ok) {
+                        ownCandle = fixKLineChanges(ownCandle, minKChange, maxKChange, minWickChange, maxWickChange);
+                    }
+                }
+
+                return { candles: ownCandle, trendKey, modelName: selected.name };
+            };
+
+            window.__kline_scoreVisualStyle = function(candles, trendKey) {
+                if (!Array.isArray(candles) || candles.length < 5) {
+                    return { score: 0, reasons: ['candles too short'] };
+                }
+
+                const closes = candles.map(c => c[1]);
+                const diffs = [];
+                for (let i = 1; i < closes.length; i++) {
+                    diffs.push(closes[i] - closes[i - 1]);
+                }
+
+                const sign = x => (x > 0 ? 1 : x < 0 ? -1 : 0);
+                const runLens = [];
+                let currentRun = 1;
+                for (let i = 1; i < diffs.length; i++) {
+                    if (sign(diffs[i]) === sign(diffs[i - 1]) && sign(diffs[i]) !== 0) currentRun++;
+                    else {
+                        runLens.push(currentRun);
+                        currentRun = 1;
+                    }
+                }
+                runLens.push(currentRun);
+
+                const maxRun = Math.max(...runLens);
+                const changes = diffs.map(d => Math.abs(d)).filter(v => v > 0);
+                const avgChange = changes.reduce((a, b) => a + b, 0) / Math.max(changes.length, 1);
+                const variance = changes.reduce((a, b) => a + Math.pow(b - avgChange, 2), 0) / Math.max(changes.length, 1);
+
+                let score = 0;
+                const reasons = [];
+
+                if (maxRun <= 3) score += 25; else reasons.push(`maxRun=${maxRun}`);
+                if (variance > 0) score += 15;
+
+                if (trendKey === 'up') {
+                    const pullbacks = diffs.filter(d => d < 0).length;
+                    if (pullbacks >= 2) score += 30; else reasons.push(`pullbacks=${pullbacks}`);
+                } else if (trendKey === 'down') {
+                    const bounces = diffs.filter(d => d > 0).length;
+                    if (bounces >= 2) score += 30; else reasons.push(`bounces=${bounces}`);
+                }
+
+                score += 30;
+                return { score, reasons, maxRun, variance };
+            };
+        }
+
+        const __klineTestMode = typeof window !== 'undefined' && Boolean(window.__KLINE_TEST_MODE__);
+        if (!__klineTestMode) {
+            loadConfig();
+            initializeDerivedDefaultBindings();
+            initializeModelSelectorBindings();
+            generateUpTrend();
+        }
     </script>
 </body>
 </html>
