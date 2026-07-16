@@ -300,7 +300,6 @@
             <div class="title">📊 1分钟K线成交明细</div>
             <div class="controls">
                 <button class="down" onclick="generateDownTrend()">生成下跌趋势</button>
-                <button class="flat" onclick="generateFlatTrend()">生成横盘趋势</button>
                 <button onclick="generateUpTrend()">生成上涨趋势</button>
             </div>
         </div>
@@ -4626,7 +4625,7 @@
         function getTrendKeyFromTargetPctValue(targetPctValue) {
             const numericValue = Number(targetPctValue);
             if (!Number.isFinite(numericValue) || numericValue === 0) {
-                return 'flat';
+                return 'up';
             }
             return numericValue > 0 ? 'up' : 'down';
         }
@@ -7415,7 +7414,7 @@
             const startMinutes = parseTimeToMinutes(startTime);
             const categories = makeTimeCategories(startMinutes, duration);
             
-            const trendKey = targetPrice > startPrice ? 'up' : targetPrice < startPrice ? 'down' : 'flat';
+            const trendKey = targetPrice < startPrice ? 'down' : 'up';
             populateModelOptionsForTrend(trendKey, formConfig.selectedModel);
             let ownCandle, selected;
             
@@ -7469,7 +7468,7 @@
                 maxChange
             };
             
-            renderChart(currentData, trendKey === 'down' ? 'down' : trendKey === 'flat' ? 'flat' : 'up', minVolume, maxVolume, minAmount, maxAmount, minTickChange, maxTickChange);
+            renderChart(currentData, trendKey === 'down' ? 'down' : 'up', minVolume, maxVolume, minAmount, maxAmount, minTickChange, maxTickChange);
         }
         
         function restoreInputValue(id, value) {
@@ -7698,7 +7697,7 @@
                 const maxWickChange = Number(config.maxWickChange);
                 const minKChange = Number(config.minKChange);
                 const maxKChange = Number(config.maxKChange);
-                const trendKey = targetPct > 0 ? 'up' : targetPct < 0 ? 'down' : 'flat';
+                const trendKey = targetPct < 0 ? 'down' : 'up';
                 const targetPrice = Math.round(startPrice * (1 + targetPct / 100));
 
                 const selected = config.modelName
